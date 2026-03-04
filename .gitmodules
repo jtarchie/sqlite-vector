@@ -1,0 +1,3 @@
+[submodule "third_party/simsimd"]
+	path = third_party/simsimd
+	url = https://github.com/ashvardanian/SimSIMD.git
