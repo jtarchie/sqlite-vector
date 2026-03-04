@@ -18,6 +18,7 @@ local SQLITE_TEXT = sqlite.SQLITE_TEXT
 local SQLITE_BLOB = sqlite.SQLITE_BLOB
 local SQLITE_NULL = sqlite.SQLITE_NULL
 local SQLITE_CONSTRAINT = sqlite.SQLITE_CONSTRAINT
+local SQLITE_MISMATCH = sqlite.SQLITE_MISMATCH
 
 local pass, fail = 0, 0
 local function check(cond, msg)
@@ -114,15 +115,12 @@ do
     sq.sqlite3_finalize(stmtp[0])
     check(rc == SQLITE_CONSTRAINT, "NULL vector INSERT returns SQLITE_CONSTRAINT")
 
-    -- DELETE: xFilter is still a stub that returns 0 rows, so the WHERE
-    -- clause never matches and xUpdate(argc=1) is never called — rc is DONE.
-    -- Once kNN search is wired up this will change to SQLITE_CONSTRAINT.
+    -- DELETE via rowid predicate should execute successfully (SQLITE_DONE).
     exec(db, "INSERT INTO v(vector) VALUES('[0.1,0.2,0.3,0.4]')")
     sq.sqlite3_prepare_v2(db, "DELETE FROM v WHERE rowid=1", -1, stmtp, nil)
     rc = sq.sqlite3_step(stmtp[0])
     sq.sqlite3_finalize(stmtp[0])
-    -- SQLITE_DONE (101): no rows found by empty xFilter → xUpdate never called
-    check(rc == SQLITE_DONE, "DELETE returns SQLITE_DONE while xFilter is a stub (rc=" .. rc .. ")")
+    check(rc == SQLITE_DONE, "DELETE returns SQLITE_DONE on success (rc=" .. rc .. ")")
 
     close_db(db)
 end
@@ -212,8 +210,7 @@ do
     exec(db, "INSERT INTO v(vector) VALUES('[0.0,1.0,0.0]')")
     exec(db, "INSERT INTO v(vector) VALUES('[0.0,0.0,1.0]')")
 
-    -- A MATCH query currently returns 0 rows (kNN not yet implemented),
-    -- so we verify the schema / column count via prepare only.
+    -- Verify MATCH query prepares and exposes expected output shape.
     local stmtp = ffi.new("sqlite3_stmt*[1]")
     local rc = sq.sqlite3_prepare_v2(db, "SELECT * FROM v WHERE v MATCH '[1.0,0.0,0.0]' LIMIT 3", -1, stmtp, nil)
     check(rc == SQLITE_OK, "MATCH query prepares successfully")
@@ -253,6 +250,38 @@ do
     check(rc == SQLITE_ERROR, "vec_distance_l2 dimension mismatch returns SQLITE_ERROR")
     msg = ffi.string(sq.sqlite3_errmsg(db))
     check(msg:find("dimension mismatch") ~= nil, "distance mismatch error message mentions dimensions: " .. msg)
+
+    close_db(db)
+end
+
+print(
+    "── FFI: rowid lookup and rowid-update rejection ─────────────────────────")
+do
+    local db = open_db()
+    exec(db, "CREATE VIRTUAL TABLE v USING vec0(dims=2, metric=l2)")
+    exec(db, "INSERT INTO v(vector) VALUES('[1.0,0.0]')")
+    exec(db, "INSERT INTO v(vector) VALUES('[0.0,1.0]')")
+
+    -- rowid point lookup should return exactly one row (rowid 2)
+    local stmtp = ffi.new("sqlite3_stmt*[1]")
+    local rc = sq.sqlite3_prepare_v2(db, "SELECT rowid FROM v WHERE rowid=2", -1, stmtp, nil)
+    check(rc == SQLITE_OK, "rowid point lookup prepares")
+    rc = sq.sqlite3_step(stmtp[0])
+    check(rc == sqlite.SQLITE_ROW, "rowid point lookup returns a row")
+    check(tonumber(sq.sqlite3_column_int64(stmtp[0], 0)) == 2, "rowid point lookup returns rowid 2")
+    rc = sq.sqlite3_step(stmtp[0])
+    check(rc == SQLITE_DONE, "rowid point lookup returns exactly one row")
+    sq.sqlite3_finalize(stmtp[0])
+
+    -- changing rowid in UPDATE must be rejected by xUpdate with SQLITE_MISMATCH
+    rc = sq.sqlite3_prepare_v2(db, "UPDATE v SET rowid=10, vector='[1.0,0.0]' WHERE rowid=1", -1, stmtp, nil)
+    check(rc == SQLITE_OK, "rowid-change UPDATE prepares")
+    rc = sq.sqlite3_step(stmtp[0])
+    check(rc == SQLITE_MISMATCH, "rowid-change UPDATE returns SQLITE_MISMATCH")
+    sq.sqlite3_finalize(stmtp[0])
+
+    local msg = ffi.string(sq.sqlite3_errmsg(db))
+    check(msg:find("cannot change rowid") ~= nil, "rowid-change UPDATE error mentions rowid immutability: " .. msg)
 
     close_db(db)
 end

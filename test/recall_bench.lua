@@ -11,6 +11,7 @@ local ffi = require "ffi"
 local sqlite = require "test.wrappers.lua_sqlite"
 local sq = sqlite.sq
 
+local SQLITE_ROW = sqlite.SQLITE_ROW
 local SQLITE_DONE = sqlite.SQLITE_DONE
 local SQLITE_TRANSIENT = sqlite.SQLITE_TRANSIENT
 
@@ -27,6 +28,7 @@ local EF_CONSTRUCTION = tonumber(os.getenv("EF_CONSTRUCTION")) or 200
 local EF_SEARCH = tonumber(os.getenv("EF_SEARCH")) or 64
 local RECALL_THRESHOLD = tonumber(os.getenv("RECALL_THRESHOLD")) or 0.80
 local SEED = tonumber(os.getenv("SEED")) or 42
+local DEBUG_RECALL = os.getenv("DEBUG_RECALL") == "1"
 
 -- ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -145,6 +147,14 @@ sq.sqlite3_finalize(ins_stmt)
 local t_insert = os.clock() - t0
 io.write(string.format("%.3fs (%.0f vec/s)\n", t_insert, N / t_insert))
 
+if DEBUG_RECALL then
+    sqlite.query(db, "SELECT key, value FROM bench_config ORDER BY key", function(stmt)
+        local k = ffi.string(sq.sqlite3_column_text(stmt, 0))
+        local v = ffi.string(sq.sqlite3_column_text(stmt, 1))
+        io.write(string.format("debug config %s=%s\n", k, v))
+    end)
+end
+
 -- ── Pick query indices ──────────────────────────────────────────────────────
 local query_indices = {}
 local step = math.max(1, math.floor(N / Q))
@@ -160,20 +170,29 @@ io.write("HNSW queries... ")
 io.flush()
 local t1 = os.clock()
 
-local match_stmt = prepare(db, "SELECT rowid FROM bench WHERE bench MATCH ? LIMIT " .. K)
-
 local hnsw_results = {} -- query_idx -> {rowid1, rowid2, ...}
+local hnsw_total_rows = 0
 for _, qi in ipairs(query_indices) do
     local qvec = vectors[qi]
-    sq.sqlite3_bind_text(match_stmt, 1, qvec, #qvec, SQLITE_TRANSIENT)
+    local sql = "SELECT rowid FROM bench WHERE bench MATCH '" .. qvec .. "' LIMIT " .. K
+    local stmt = prepare(db, sql)
     local rowids = {}
-    while sq.sqlite3_step(match_stmt) == SQLITE_ROW do
-        rowids[#rowids + 1] = tonumber(sq.sqlite3_column_int64(match_stmt, 0))
+    while true do
+        local rc = sq.sqlite3_step(stmt)
+        if rc == SQLITE_ROW then
+            rowids[#rowids + 1] = tonumber(sq.sqlite3_column_int64(stmt, 0))
+        elseif rc == SQLITE_DONE then
+            break
+        else
+            local msg = ffi.string(sq.sqlite3_errmsg(db))
+            sq.sqlite3_finalize(stmt)
+            error(string.format("hnsw query failed (rc=%d): %s\nSQL: %s", rc, msg, sql))
+        end
     end
-    sq.sqlite3_reset(match_stmt)
+    sq.sqlite3_finalize(stmt)
     hnsw_results[qi] = rowids
+    hnsw_total_rows = hnsw_total_rows + #rowids
 end
-sq.sqlite3_finalize(match_stmt)
 
 local t_hnsw = os.clock() - t1
 io.write(string.format("%.3fs (%.1f ms/query)\n", t_hnsw, t_hnsw / #query_indices * 1000))
@@ -185,6 +204,7 @@ io.flush()
 local t2 = os.clock()
 
 local bf_results = {} -- query_idx -> {rowid1, rowid2, ...}
+local bf_total_rows = 0
 for _, qi in ipairs(query_indices) do
     local qnum = vectors_num[qi]
     local scored = {}
@@ -206,6 +226,7 @@ for _, qi in ipairs(query_indices) do
     end
 
     bf_results[qi] = rowids
+    bf_total_rows = bf_total_rows + #rowids
 end
 
 local t_bf = os.clock() - t2
@@ -243,6 +264,25 @@ end
 
 local mean_recall = total_recall / #query_indices
 
+if DEBUG_RECALL and #query_indices > 0 then
+    local qi = query_indices[1]
+    local h = hnsw_results[qi] or {}
+    local b = bf_results[qi] or {}
+    local bset = {}
+    for _, rid in ipairs(b) do
+        bset[rid] = true
+    end
+    local hits = 0
+    for _, rid in ipairs(h) do
+        if bset[rid] then
+            hits = hits + 1
+        end
+    end
+    io.write(string.format("debug first query idx=%d hnsw=[%s]\n", qi, table.concat(h, ",")))
+    io.write(string.format("debug first query idx=%d brute=[%s]\n", qi, table.concat(b, ",")))
+    io.write(string.format("debug first query overlap=%d/%d\n", hits, K))
+end
+
 -- ── Report ──────────────────────────────────────────────────────────────────
 io.write("\n")
 io.write(string.format("  %-24s %d\n", "vectors:", N))
@@ -256,6 +296,8 @@ io.write(string.format("  %-24s %d\n", "ef_search:", EF_SEARCH))
 io.write(string.format("  %-24s %.3fs\n", "insert time:", t_insert))
 io.write(string.format("  %-24s %.1f ms\n", "hnsw query (avg):", t_hnsw / #query_indices * 1000))
 io.write(string.format("  %-24s %.1f ms\n", "brute-force query (avg):", t_bf / #query_indices * 1000))
+io.write(string.format("  %-24s %.1f\n", "hnsw rows/query:", hnsw_total_rows / #query_indices))
+io.write(string.format("  %-24s %.1f\n", "brute rows/query:", bf_total_rows / #query_indices))
 io.write(string.format("  %-24s %.4f\n", "recall@k (mean):", mean_recall))
 io.write(string.format("  %-24s %.4f\n", "recall@k (min):", min_recall))
 io.write(string.format("  %-24s %.4f\n", "recall@k (max):", max_recall))

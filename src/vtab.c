@@ -32,9 +32,11 @@ struct Vec0Table {
   /* Cached prepared statements — prepared once in xCreate/xConnect,
    * finalized in xDisconnect/xDestroy.  Passed to hnsw_* via HnswCtx
    * to avoid per-call sqlite3_prepare_v2/sqlite3_finalize overhead. */
-  sqlite3_stmt *sc_get_nbrs; /* SELECT neighbor_id, distance FROM _graph WHERE
-                                layer=? AND node_id=? */
-  sqlite3_stmt *sc_get_vec;  /* SELECT vector FROM _data WHERE id=? */
+  sqlite3_stmt *sc_get_nbrs;  /* SELECT neighbor_id, distance FROM _graph WHERE
+                                 layer=? AND node_id=? */
+  sqlite3_stmt *sc_get_vec;   /* SELECT vector FROM _data WHERE id=? */
+  sqlite3_stmt *sc_scan_ids;  /* SELECT id FROM _data ORDER BY id */
+  sqlite3_stmt *sc_lookup_id; /* SELECT id FROM _data WHERE id=? */
   sqlite3_stmt
       *sc_ins_edge; /* INSERT OR REPLACE INTO _graph(...) VALUES(?,?,?,?) */
   sqlite3_stmt
@@ -88,6 +90,8 @@ static void vec0_free(Vec0Table *p) {
   sqlite3_free(p->metric);
   sqlite3_finalize(p->sc_get_nbrs);
   sqlite3_finalize(p->sc_get_vec);
+  sqlite3_finalize(p->sc_scan_ids);
+  sqlite3_finalize(p->sc_lookup_id);
   sqlite3_finalize(p->sc_ins_edge);
   sqlite3_finalize(p->sc_del_edges);
   sqlite3_finalize(p->sc_ins_layer);
@@ -96,7 +100,7 @@ static void vec0_free(Vec0Table *p) {
   sqlite3_free(p);
 }
 
-/* Prepare the seven shared HNSW statements and store them on the Vec0Table.
+/* Prepare shared statements and store them on the Vec0Table.
  * Called from vec0Init after name/schema are set and shadow tables exist. */
 static int vec0_prepare_stmts(Vec0Table *p, char **pzErr) {
   char *sql;
@@ -120,6 +124,10 @@ static int vec0_prepare_stmts(Vec0Table *p, char **pzErr) {
        p->schema, p->name);
   PREP(sc_get_vec, "SELECT vector FROM \"%w\".\"%w_data\" WHERE id=?",
        p->schema, p->name);
+  PREP(sc_scan_ids, "SELECT id FROM \"%w\".\"%w_data\" ORDER BY id", p->schema,
+       p->name);
+  PREP(sc_lookup_id, "SELECT id FROM \"%w\".\"%w_data\" WHERE id=?", p->schema,
+       p->name);
   PREP(sc_ins_edge,
        "INSERT OR REPLACE INTO \"%w\".\"%w_graph\""
        "(layer, node_id, neighbor_id, distance) VALUES (?,?,?,?)",
@@ -574,94 +582,93 @@ static int vec0Close(sqlite3_vtab_cursor *pCursor) {
   return SQLITE_OK;
 }
 
-/* ── xFilter ─────────────────────────────────────────────────────────────────
- */
-
-static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
-                      const char *idxStr, int argc, sqlite3_value **argv) {
-  (void)idxStr;
-  (void)argc;
-  (void)argv;
-
-  Vec0Cursor *cur = (Vec0Cursor *)pCursor;
-
-  /* Free previous results */
+static void vec0_cursor_clear_results(Vec0Cursor *cur) {
   sqlite3_free(cur->rowids);
   sqlite3_free(cur->distances);
   cur->rowids = NULL;
   cur->distances = NULL;
   cur->nResults = 0;
   cur->pos = 0;
+}
 
-  if (idxNum == 0) {
-    /* Full scan — read every rowid from _data */
-    Vec0Table *p = (Vec0Table *)pCursor->pVtab;
-    char *sql = sqlite3_mprintf("SELECT id FROM \"%w\".\"%w_data\" ORDER BY id",
-                                p->schema, p->name);
-    sqlite3_stmt *stmt = NULL;
-    if (!sql || sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-      sqlite3_free(sql);
-      return SQLITE_OK; /* return empty on error */
+static void vec0_stmt_rewind(sqlite3_stmt *stmt) {
+  if (!stmt)
+    return;
+  sqlite3_reset(stmt);
+  sqlite3_clear_bindings(stmt);
+}
+
+static int vec0_filter_fullscan(Vec0Cursor *cur) {
+  Vec0Table *p = (Vec0Table *)cur->base.pVtab;
+  if (!p->sc_scan_ids)
+    return SQLITE_OK; /* return empty on error */
+
+  vec0_stmt_rewind(p->sc_scan_ids);
+
+  int cap = 16;
+  int n = 0;
+  cur->rowids = sqlite3_malloc(cap * (int)sizeof(int64_t));
+  if (!cur->rowids) {
+    vec0_stmt_rewind(p->sc_scan_ids);
+    return SQLITE_NOMEM;
+  }
+
+  int step_rc;
+  while ((step_rc = sqlite3_step(p->sc_scan_ids)) == SQLITE_ROW) {
+    if (n == cap) {
+      cap *= 2;
+      int64_t *tmp = sqlite3_realloc(cur->rowids, cap * (int)sizeof(int64_t));
+      if (!tmp) {
+        vec0_stmt_rewind(p->sc_scan_ids);
+        return SQLITE_NOMEM;
+      }
+      cur->rowids = tmp;
     }
-    sqlite3_free(sql);
-    /* Count rows first */
-    int cap = 16, n = 0;
-    cur->rowids = sqlite3_malloc(cap * (int)sizeof(int64_t));
+    cur->rowids[n++] = sqlite3_column_int64(p->sc_scan_ids, 0);
+  }
+
+  vec0_stmt_rewind(p->sc_scan_ids);
+  if (step_rc != SQLITE_DONE) {
+    sqlite3_free(cur->rowids);
+    cur->rowids = NULL;
+    cur->nResults = 0;
+    return SQLITE_ERROR;
+  }
+
+  cur->nResults = n;
+  return SQLITE_OK;
+}
+
+static int vec0_filter_rowid_eq(Vec0Cursor *cur, int argc,
+                                sqlite3_value **argv) {
+  Vec0Table *p = (Vec0Table *)cur->base.pVtab;
+  if (argc < 1 || !p->sc_lookup_id)
+    return SQLITE_OK;
+
+  sqlite3_int64 target = sqlite3_value_int64(argv[0]);
+  vec0_stmt_rewind(p->sc_lookup_id);
+  sqlite3_bind_int64(p->sc_lookup_id, 1, target);
+
+  int step_rc = sqlite3_step(p->sc_lookup_id);
+  if (step_rc == SQLITE_ROW) {
+    cur->rowids = sqlite3_malloc((int)sizeof(int64_t));
     if (!cur->rowids) {
-      sqlite3_finalize(stmt);
+      vec0_stmt_rewind(p->sc_lookup_id);
       return SQLITE_NOMEM;
     }
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-      if (n == cap) {
-        cap *= 2;
-        int64_t *tmp = sqlite3_realloc(cur->rowids, cap * (int)sizeof(int64_t));
-        if (!tmp) {
-          sqlite3_finalize(stmt);
-          return SQLITE_NOMEM;
-        }
-        cur->rowids = tmp;
-      }
-      cur->rowids[n++] = sqlite3_column_int64(stmt, 0);
-    }
-    sqlite3_finalize(stmt);
-    cur->nResults = n;
-    /* distances left NULL — xColumn col 2 returns NULL */
-    return SQLITE_OK;
+    cur->rowids[0] = sqlite3_column_int64(p->sc_lookup_id, 0);
+    cur->nResults = 1;
+  } else if (step_rc != SQLITE_DONE) {
+    vec0_stmt_rewind(p->sc_lookup_id);
+    return SQLITE_ERROR;
   }
+  vec0_stmt_rewind(p->sc_lookup_id);
+  return SQLITE_OK;
+}
 
-  if (idxNum == 2) {
-    /* Rowid equality lookup */
-    Vec0Table *p = (Vec0Table *)pCursor->pVtab;
-    if (argc < 1)
-      return SQLITE_OK;
-    sqlite3_int64 target = sqlite3_value_int64(argv[0]);
-    char *sql =
-        sqlite3_mprintf("SELECT id FROM \"%w\".\"%w_data\" WHERE id=%lld",
-                        p->schema, p->name, target);
-    sqlite3_stmt *stmt = NULL;
-    if (sql && sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-      sqlite3_free(sql);
-      if (sqlite3_step(stmt) == SQLITE_ROW) {
-        cur->rowids = sqlite3_malloc((int)sizeof(int64_t));
-        if (!cur->rowids) {
-          sqlite3_finalize(stmt);
-          return SQLITE_NOMEM;
-        }
-        cur->rowids[0] = sqlite3_column_int64(stmt, 0);
-        cur->nResults = 1;
-      }
-      sqlite3_finalize(stmt);
-    } else {
-      sqlite3_free(sql);
-    }
-    return SQLITE_OK;
-  }
-
-  /* kNN path: idxNum==1 (MATCH) or idxNum 151-156 (operator alias) */
-  if (idxNum != 1 && (idxNum < 151 || idxNum > 156))
-    return SQLITE_OK; /* unknown index — return empty */
-
-  Vec0Table *p = (Vec0Table *)pCursor->pVtab;
+static int vec0_filter_knn(Vec0Cursor *cur, int idxNum, int argc,
+                           sqlite3_value **argv) {
+  Vec0Table *p = (Vec0Table *)cur->base.pVtab;
 
   if (argc < 1 || sqlite3_value_type(argv[0]) == SQLITE_NULL)
     return SQLITE_OK;
@@ -677,24 +684,19 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   }
   if (query_dims != p->dims) {
     sqlite3_free(query_vec);
-    pCursor->pVtab->zErrMsg = sqlite3_mprintf(
+    cur->base.pVtab->zErrMsg = sqlite3_mprintf(
         "vec0: query has %d dims, table has %d", query_dims, p->dims);
     return SQLITE_ERROR;
   }
 
-  /* ef_search: use per-query override from argv[1] (col 3 EQ), else table
-   * default */
   int ef = p->ef_search;
   if (argc >= 2 && sqlite3_value_type(argv[1]) == SQLITE_INTEGER) {
     int v = sqlite3_value_int(argv[1]);
     if (v > 0)
       ef = v;
   }
-  /* k = ef_search so the beam covers at least as many candidates as requested;
-   * SQLite's native LIMIT trims the final output row count. */
   int k = ef;
 
-  /* Resolve distance function: operator alias overrides table metric */
   dist_fn_t knn_dist_fn = p->dist_fn;
   if (idxNum >= 151 && idxNum <= 156) {
     static const char *op_metrics[] = {"l2", "cosine",  "ip",
@@ -706,7 +708,7 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
 
   HnswCtx hctx;
   vec0_make_hctx(p, &hctx);
-  hctx.ef_search = ef; /* per-query override or table default */
+  hctx.ef_search = ef;
   hctx.dist_fn = knn_dist_fn;
 
   HnswResult *results = NULL;
@@ -728,6 +730,7 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
     cur->distances = NULL;
     return SQLITE_NOMEM;
   }
+
   for (int i = 0; i < nResults; i++) {
     cur->rowids[i] = results[i].rowid;
     cur->distances[i] = results[i].dist;
@@ -735,6 +738,30 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   cur->nResults = nResults;
   sqlite3_free(results);
   return SQLITE_OK;
+}
+
+/* ── xFilter ─────────────────────────────────────────────────────────────────
+ */
+
+static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
+                      const char *idxStr, int argc, sqlite3_value **argv) {
+  (void)idxStr;
+  (void)argc;
+  (void)argv;
+
+  Vec0Cursor *cur = (Vec0Cursor *)pCursor;
+  vec0_cursor_clear_results(cur);
+
+  if (idxNum == 0)
+    return vec0_filter_fullscan(cur);
+
+  if (idxNum == 2)
+    return vec0_filter_rowid_eq(cur, argc, argv);
+
+  if (idxNum != 1 && (idxNum < 151 || idxNum > 156))
+    return SQLITE_OK;
+
+  return vec0_filter_knn(cur, idxNum, argc, argv);
 }
 
 /* ── xNext / xEof ────────────────────────────────────────────────────────────
@@ -751,6 +778,53 @@ static int vec0Eof(sqlite3_vtab_cursor *pCursor) {
   return cur->pos >= cur->nResults;
 }
 
+static void vec0_result_vector_text(Vec0Cursor *cur, sqlite3_context *ctx) {
+  Vec0Table *p = (Vec0Table *)cur->base.pVtab;
+  if (p->sc_get_vec) {
+    vec0_stmt_rewind(p->sc_get_vec);
+    sqlite3_bind_int64(p->sc_get_vec, 1, cur->rowids[cur->pos]);
+    int step_rc = sqlite3_step(p->sc_get_vec);
+    if (step_rc == SQLITE_ROW) {
+      int bytes = sqlite3_column_bytes(p->sc_get_vec, 0);
+      const float *blob = (const float *)sqlite3_column_blob(p->sc_get_vec, 0);
+      int dims = bytes / (int)sizeof(float);
+      char *text = vec_format(blob, dims);
+      if (text)
+        sqlite3_result_text(ctx, text, -1, sqlite3_free);
+      else
+        sqlite3_result_null(ctx);
+    } else {
+      sqlite3_result_null(ctx);
+    }
+    vec0_stmt_rewind(p->sc_get_vec);
+    return;
+  }
+
+  char *sql =
+      sqlite3_mprintf("SELECT vector FROM \"%w\".\"%w_data\" WHERE id=%lld",
+                      p->schema, p->name, cur->rowids[cur->pos]);
+  sqlite3_stmt *stmt = NULL;
+  if (!sql || sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+    sqlite3_free(sql);
+    sqlite3_result_null(ctx);
+    return;
+  }
+  sqlite3_free(sql);
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    int bytes = sqlite3_column_bytes(stmt, 0);
+    const float *blob = (const float *)sqlite3_column_blob(stmt, 0);
+    int dims = bytes / (int)sizeof(float);
+    char *text = vec_format(blob, dims);
+    if (text)
+      sqlite3_result_text(ctx, text, -1, sqlite3_free);
+    else
+      sqlite3_result_null(ctx);
+  } else {
+    sqlite3_result_null(ctx);
+  }
+  sqlite3_finalize(stmt);
+}
+
 /* ── xColumn ─────────────────────────────────────────────────────────────────
  */
 
@@ -765,32 +839,8 @@ static int vec0Column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx,
   case 0: /* hidden table-name column (MATCH input) — return NULL */
     sqlite3_result_null(ctx);
     break;
-  case 1: { /* vector TEXT — fetch blob from _data and format as [x,y,...] */
-    Vec0Table *p = (Vec0Table *)pCursor->pVtab;
-    char *sql =
-        sqlite3_mprintf("SELECT vector FROM \"%w\".\"%w_data\" WHERE id=%lld",
-                        p->schema, p->name, cur->rowids[cur->pos]);
-    sqlite3_stmt *stmt = NULL;
-    if (sql && sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-      sqlite3_free(sql);
-      if (sqlite3_step(stmt) == SQLITE_ROW) {
-        int bytes = sqlite3_column_bytes(stmt, 0);
-        const float *blob = (const float *)sqlite3_column_blob(stmt, 0);
-        int dims = bytes / (int)sizeof(float);
-        char *text = vec_format(blob, dims);
-        if (text) {
-          sqlite3_result_text(ctx, text, -1, sqlite3_free);
-        } else {
-          sqlite3_result_null(ctx);
-        }
-      } else {
-        sqlite3_result_null(ctx);
-      }
-      sqlite3_finalize(stmt);
-    } else {
-      sqlite3_free(sql);
-      sqlite3_result_null(ctx);
-    }
+  case 1: { /* vector TEXT */
+    vec0_result_vector_text(cur, ctx);
     break;
   }
   case 2: /* distance REAL */

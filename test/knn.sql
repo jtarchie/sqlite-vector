@@ -62,6 +62,14 @@ INSERT INTO assert VALUES(
   (SELECT COUNT(*) FROM fullscan WHERE distance IS NOT NULL) = 0
 );
 
+-- ── Rowid point lookup path ───────────────────────────────────────────────
+CREATE TEMP TABLE point AS
+  SELECT rowid, vector, distance FROM vecs WHERE rowid=2;
+
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM point) = 1);
+INSERT INTO assert VALUES((SELECT rowid FROM point) = 2);
+INSERT INTO assert VALUES((SELECT distance FROM point) IS NULL);
+
 -- ── DELETE removes from kNN results ──────────────────────────────────────
 DELETE FROM vecs WHERE rowid=1;
 
@@ -114,5 +122,24 @@ INSERT INTO assert VALUES(
    ORDER BY (SELECT distance FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' AND ef_search=200 LIMIT 1)
    LIMIT 1) IS NOT NULL
 );
+
+-- ef_search <= 0 is ignored and should fall back to table default behavior
+CREATE TEMP TABLE knn_default AS
+  SELECT rowid FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' LIMIT 4;
+
+CREATE TEMP TABLE knn_ef0 AS
+  SELECT rowid FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' AND ef_search=0 LIMIT 4;
+
+CREATE TEMP TABLE knn_efneg AS
+  SELECT rowid FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' AND ef_search=-5 LIMIT 4;
+
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM knn_ef0) = (SELECT COUNT(*) FROM knn_default));
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM knn_efneg) = (SELECT COUNT(*) FROM knn_default));
+
+-- Non-integer ef_search value is ignored and falls back to default
+CREATE TEMP TABLE knn_eftext AS
+  SELECT rowid FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' AND ef_search='bad' LIMIT 4;
+
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM knn_eftext) = (SELECT COUNT(*) FROM knn_default));
 
 SELECT 'knn tests passed';
