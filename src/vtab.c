@@ -1,4 +1,5 @@
 #include "vtab.h"
+#include "vec_parse.h"
 
 #include <sqlite3ext.h>
 #include <stdint.h>
@@ -435,6 +436,88 @@ static int vec0Rowid(sqlite3_vtab_cursor *pCursor, sqlite_int64 *pRowid) {
   return SQLITE_OK;
 }
 
+/* ── xUpdate ────────────────────────────────────────────────────────────────
+ *
+ * argv mapping for a 3-column schema (hidden, vector TEXT, distance REAL
+ * HIDDEN): argv[0]  old rowid        (NULL on INSERT) argv[1]  new rowid (NULL
+ * → auto-assign) argv[2]  col 0 value      (hidden table-name col — ignore)
+ *   argv[3]  col 1 value      (vector TEXT — the payload)
+ *   argv[4]  col 2 value      (distance REAL HIDDEN — ignore on INSERT)
+ */
+
+static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
+                      sqlite_int64 *pRowid) {
+  Vec0Table *p = (Vec0Table *)pVtab;
+
+  /* DELETE: argc == 1 */
+  if (argc == 1) {
+    pVtab->zErrMsg = sqlite3_mprintf("vec0: DELETE not yet supported");
+    return SQLITE_CONSTRAINT;
+  }
+
+  /* UPDATE: argv[0] is not NULL (existing row being replaced) */
+  if (sqlite3_value_type(argv[0]) != SQLITE_NULL) {
+    pVtab->zErrMsg = sqlite3_mprintf("vec0: UPDATE not yet supported");
+    return SQLITE_CONSTRAINT;
+  }
+
+  /* INSERT: argv[1] is NULL (auto-assign rowid) or an explicit integer. */
+
+  /* argv[3] == col 1 == vector TEXT */
+  if (sqlite3_value_type(argv[3]) == SQLITE_NULL) {
+    pVtab->zErrMsg = sqlite3_mprintf("vec0: vector must not be NULL");
+    return SQLITE_CONSTRAINT;
+  }
+  const char *text = (const char *)sqlite3_value_text(argv[3]);
+
+  float *vec = NULL;
+  int dims = 0;
+  char *err = NULL;
+  int rc = vec_parse(text, &vec, &dims, &err);
+  if (rc != SQLITE_OK) {
+    pVtab->zErrMsg = err ? err : sqlite3_mprintf("vec0: invalid vector");
+    return SQLITE_ERROR;
+  }
+  if (dims != p->dims) {
+    sqlite3_free(vec);
+    pVtab->zErrMsg =
+        sqlite3_mprintf("vec0: expected %d dims, got %d", p->dims, dims);
+    return SQLITE_CONSTRAINT;
+  }
+
+  /* Insert raw float BLOB into _data */
+  char *sql = sqlite3_mprintf(
+      "INSERT INTO \"%w\".\"%w_data\" (vector) VALUES (?)", p->schema, p->name);
+  sqlite3_stmt *stmt = NULL;
+  rc = sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL);
+  sqlite3_free(sql);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(vec);
+    pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+    return rc;
+  }
+  sqlite3_bind_blob(stmt, 1, vec, dims * (int)sizeof(float), SQLITE_TRANSIENT);
+  sqlite3_free(vec);
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_DONE) {
+    pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+    return SQLITE_ERROR;
+  }
+
+  *pRowid = sqlite3_last_insert_rowid(p->db);
+  p->count++;
+
+  /* Keep count in _config in sync */
+  sql = sqlite3_mprintf(
+      "UPDATE \"%w\".\"%w_config\" SET value = '%lld' WHERE key = 'count'",
+      p->schema, p->name, p->count);
+  sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+
+  return SQLITE_OK;
+}
+
 /* ── xShadowName ─────────────────────────────────────────────────────────────
  */
 
@@ -464,7 +547,7 @@ sqlite3_module vec0Module = {
     /* xEof        */ vec0Eof,
     /* xColumn     */ vec0Column,
     /* xRowid      */ vec0Rowid,
-    /* xUpdate     */ NULL, /* read-only until INSERT is implemented */
+    /* xUpdate     */ vec0Update,
     /* xBegin      */ NULL,
     /* xSync       */ NULL,
     /* xCommit     */ NULL,
