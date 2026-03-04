@@ -25,33 +25,34 @@ SELECT rowid, distance FROM items WHERE items MATCH vec('[0.1, ...]') LIMIT 10;
 
 ## Built so far
 
-- `xmake.lua` — shared lib build targeting `sqlite_vector`; macOS
-  `-undefined dynamic_lookup`; SimSIMD include path
-- `include/sqlite3.h` + `include/sqlite3ext.h` — bundled from Homebrew SQLite
-  3.51.2
-- `third_party/simsimd` — git submodule (ashvardanian/SimSIMD, header-only,
-  Apache-2.0)
-- `src/extension.c` — `sqlite3_sqlitevector_init` entry point; registers `vec0`
-  module and all scalar functions
-- `src/vtab.h` — `vec0Module` extern declaration, `VEC0_MODULE_NAME` constant
-- `src/vtab.c` — `sqlite3_module` with `iVersion=3`; `xCreate`/`xConnect` parse
-  `dims`, `metric`, `m`, `ef_construction`, `ef_search` from argv; dynamic
-  schema declares hidden table-name col at index 0 (enables `MATCH` syntax);
-  `xBestIndex` routes `MATCH` on col 0 → `idxNum=1`; `xShadowName` guards
-  `config`/`data`/`graph`/`layers`; `xUpdate=NULL` (read-only)
-- `src/vec_parse.h` + `src/vec_parse.c` — `vec_parse()` tokenises `[x,y,z]` text
-  into a `float*` (sqlite3_malloc'd); `vec_format()` serialises back; SQL scalar
-  functions: `vec(text)` (validate + normalise), `vec_dims(text)` (dimension
-  count), `vec_norm(text)` (L2 norm via pure-C loop)
-- `test/basic.sql` — smoke test: extension loads, `CREATE VIRTUAL TABLE`,
-  `MATCH` query returns empty without error
-- `test/vec_parse.sql` — assertions for `vec()`, `vec_dims()`, `vec_norm()`:
-  round-trip normalisation, whitespace tolerance, 3-4-5 norm, NULL passthrough
-- `.gitignore` — excludes `build/`, `.xmake/`, compiled artifacts
+- **Build**: `xmake.lua` — shared lib; macOS `-undefined dynamic_lookup`;
+  SimSIMD include path. Bundled `include/sqlite3{,ext}.h` (SQLite 3.51.2).
+  SimSIMD as `third_party/simsimd` git submodule (header-only, Apache-2.0).
+- **`src/extension.c`** — `sqlite3_sqlitevector_init` entry point; registers
+  `vec0` module, `vec_parse` scalars, and distance scalars.
+- **`src/vec_parse.{h,c}`** — `vec_parse()` / `vec_format()`; SQL scalars
+  `vec()`, `vec_dims()`, `vec_norm()`.
+- **`src/distance.{h,c}`** — Six SimSIMD-backed kernels (`l2`, `cosine`, `ip`,
+  `l1`, `hamming`, `jaccard`); `distance_for_metric()` resolver; SQL scalars
+  `vec_distance_*`.
+- **`src/hnsw.{h,c}`** — Full SQL-native HNSW: `hnsw_search`, `hnsw_insert`,
+  `hnsw_delete`. All graph state in shadow tables; C heap holds only candidate
+  heaps (O(ef) nodes). Binary min/max-heaps + sorted visited set. Random-level
+  sampling, bidirectional edge pruning, entry-point election on delete (v1: no
+  graph repair).
+- **`src/vtab.{h,c}`** — Complete `sqlite3_module` (iVersion=3):
+  `xCreate`/`xConnect`/`xDisconnect`/`xDestroy` (4 shadow tables + config
+  persistence); `xBestIndex` (MATCH → kNN, rowid-eq → point lookup, full-scan
+  fallback); `xFilter` calling `hnsw_search`; `xColumn` fetching vector BLOBs as
+  `[x,y,z]` text; `xUpdate` for INSERT (→ `hnsw_insert`) and DELETE (→
+  `hnsw_delete`); `xShadowName`.
+- **Tests** (all passing via `test/run_all.sh`): `basic.sql`, `vec_parse.sql`,
+  `distance.sql`, `shadow.sql`, `insert.sql`, `ffi_test.lua`, `shadow_connect`
+  (xConnect persistence via `test/wrappers/run_shadow_connect.sh`).
 
-**Not yet built:** `distance.c`, `hnsw.c`, shadow table creation in
-`xCreate`/`xDestroy`, config read in `xConnect`, `xUpdate` (INSERT/DELETE), kNN
-search in `xFilter`.
+**Not yet built:** `xFindFunction` (operator aliases `<->`, `<=>`, `<#>`,
+`<+>`); UPDATE (delete + reinsert); full-scan `xFilter` (idxNum=0 returns
+empty); accuracy/recall benchmarks.
 
 ---
 

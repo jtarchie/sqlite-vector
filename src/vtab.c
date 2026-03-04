@@ -1,4 +1,6 @@
 #include "vtab.h"
+#include "distance.h"
+#include "hnsw.h"
 #include "vec_parse.h"
 
 #include <sqlite3ext.h>
@@ -25,6 +27,7 @@ struct Vec0Table {
   sqlite3_int64 entry_point; /* Rowid of the current HNSW entry-point node */
   int max_layer;             /* Maximum layer in the HNSW graph */
   sqlite3_int64 count;       /* Number of vectors stored */
+  dist_fn_t dist_fn; /* Distance kernel (set from metric at init time) */
 };
 
 typedef struct Vec0Cursor Vec0Cursor;
@@ -255,6 +258,14 @@ static int vec0Init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
     }
   }
 
+  /* Resolve distance kernel from metric string */
+  p->dist_fn = distance_for_metric(p->metric);
+  if (!p->dist_fn) {
+    *pzErr = sqlite3_mprintf("vec0: unknown metric '%s'", p->metric);
+    vec0_free(p);
+    return SQLITE_ERROR;
+  }
+
   {
     int rc = vec0_declare(db, p->name, pzErr);
     if (rc != SQLITE_OK) {
@@ -306,9 +317,8 @@ static int vec0Destroy(sqlite3_vtab *pVtab) {
 static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   (void)pVtab;
 
-  /* Look for a MATCH constraint on col 0 (the hidden table-name column).
-   * WHERE vecs MATCH query  →  constraint on col 0, op =
-   * SQLITE_INDEX_CONSTRAINT_MATCH */
+  /* 1. Look for a MATCH constraint on col 0 (the hidden table-name column).
+   * WHERE vecs MATCH query  →  kNN path */
   for (int i = 0; i < pInfo->nConstraint; i++) {
     if (!pInfo->aConstraint[i].usable)
       continue;
@@ -324,8 +334,23 @@ static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     }
   }
 
-  /* Full scan fallback (very expensive — discourages the planner from using it
-   * without a MATCH constraint) */
+  /* 2. Rowid equality — used for DELETE/point lookups. */
+  for (int i = 0; i < pInfo->nConstraint; i++) {
+    if (!pInfo->aConstraint[i].usable)
+      continue;
+    if (pInfo->aConstraint[i].iColumn == -1 &&
+        pInfo->aConstraint[i].op == SQLITE_INDEX_CONSTRAINT_EQ) {
+      pInfo->aConstraintUsage[i].argvIndex = 1;
+      pInfo->aConstraintUsage[i].omit = 1;
+      pInfo->idxNum = 2; /* rowid lookup */
+      pInfo->idxFlags = SQLITE_INDEX_SCAN_UNIQUE;
+      pInfo->estimatedCost = 1.0;
+      pInfo->estimatedRows = 1;
+      return SQLITE_OK;
+    }
+  }
+
+  /* 3. Full scan fallback */
   pInfo->idxNum = 0;
   pInfo->estimatedCost = 1e9;
   pInfo->estimatedRows = 100000;
@@ -373,11 +398,136 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   cur->pos = 0;
 
   if (idxNum == 0) {
-    /* Full scan: not yet implemented — return empty */
+    /* Full scan — read every rowid from _data */
+    Vec0Table *p = (Vec0Table *)pCursor->pVtab;
+    char *sql = sqlite3_mprintf("SELECT id FROM \"%w\".\"%w_data\" ORDER BY id",
+                                p->schema, p->name);
+    sqlite3_stmt *stmt = NULL;
+    if (!sql || sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+      sqlite3_free(sql);
+      return SQLITE_OK; /* return empty on error */
+    }
+    sqlite3_free(sql);
+    /* Count rows first */
+    int cap = 16, n = 0;
+    cur->rowids = sqlite3_malloc(cap * (int)sizeof(int64_t));
+    if (!cur->rowids) {
+      sqlite3_finalize(stmt);
+      return SQLITE_NOMEM;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      if (n == cap) {
+        cap *= 2;
+        int64_t *tmp = sqlite3_realloc(cur->rowids, cap * (int)sizeof(int64_t));
+        if (!tmp) {
+          sqlite3_finalize(stmt);
+          return SQLITE_NOMEM;
+        }
+        cur->rowids = tmp;
+      }
+      cur->rowids[n++] = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    cur->nResults = n;
+    /* distances left NULL — xColumn col 2 returns NULL */
     return SQLITE_OK;
   }
 
-  /* kNN path: HNSW search will be implemented in a subsequent commit */
+  if (idxNum == 2) {
+    /* Rowid equality lookup */
+    Vec0Table *p = (Vec0Table *)pCursor->pVtab;
+    if (argc < 1)
+      return SQLITE_OK;
+    sqlite3_int64 target = sqlite3_value_int64(argv[0]);
+    char *sql =
+        sqlite3_mprintf("SELECT id FROM \"%w\".\"%w_data\" WHERE id=%lld",
+                        p->schema, p->name, target);
+    sqlite3_stmt *stmt = NULL;
+    if (sql && sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+      sqlite3_free(sql);
+      if (sqlite3_step(stmt) == SQLITE_ROW) {
+        cur->rowids = sqlite3_malloc((int)sizeof(int64_t));
+        if (!cur->rowids) {
+          sqlite3_finalize(stmt);
+          return SQLITE_NOMEM;
+        }
+        cur->rowids[0] = sqlite3_column_int64(stmt, 0);
+        cur->nResults = 1;
+      }
+      sqlite3_finalize(stmt);
+    } else {
+      sqlite3_free(sql);
+    }
+    return SQLITE_OK;
+  }
+
+  /* kNN path */
+  Vec0Table *p = (Vec0Table *)pCursor->pVtab;
+
+  if (argc < 1 || sqlite3_value_type(argv[0]) == SQLITE_NULL)
+    return SQLITE_OK;
+
+  const char *query_text = (const char *)sqlite3_value_text(argv[0]);
+  float *query_vec = NULL;
+  int query_dims = 0;
+  char *parse_err = NULL;
+  int rc = vec_parse(query_text, &query_vec, &query_dims, &parse_err);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(parse_err);
+    return rc;
+  }
+  if (query_dims != p->dims) {
+    sqlite3_free(query_vec);
+    pCursor->pVtab->zErrMsg = sqlite3_mprintf(
+        "vec0: query has %d dims, table has %d", query_dims, p->dims);
+    return SQLITE_ERROR;
+  }
+
+  /* Default k: from LIMIT argv[1] if present, else ef_search */
+  int k = p->ef_search;
+  if (argc >= 2 && sqlite3_value_type(argv[1]) == SQLITE_INTEGER) {
+    int lim = sqlite3_value_int(argv[1]);
+    if (lim > 0)
+      k = lim;
+  }
+
+  HnswCtx hctx;
+  hctx.db = p->db;
+  hctx.schema = p->schema;
+  hctx.tbl_name = p->name;
+  hctx.dims = p->dims;
+  hctx.m = p->m;
+  hctx.ef_construction = p->ef_construction;
+  hctx.ef_search = p->ef_search;
+  hctx.entry_point = p->entry_point;
+  hctx.max_layer = p->max_layer;
+  hctx.dist_fn = p->dist_fn;
+
+  HnswResult *results = NULL;
+  int nResults = 0;
+  rc = hnsw_search(&hctx, query_vec, k, &results, &nResults);
+  sqlite3_free(query_vec);
+  if (rc != SQLITE_OK)
+    return rc;
+
+  cur->rowids =
+      sqlite3_malloc((nResults > 0 ? nResults : 1) * (int)sizeof(int64_t));
+  cur->distances =
+      sqlite3_malloc((nResults > 0 ? nResults : 1) * (int)sizeof(double));
+  if (!cur->rowids || !cur->distances) {
+    sqlite3_free(results);
+    sqlite3_free(cur->rowids);
+    sqlite3_free(cur->distances);
+    cur->rowids = NULL;
+    cur->distances = NULL;
+    return SQLITE_NOMEM;
+  }
+  for (int i = 0; i < nResults; i++) {
+    cur->rowids[i] = results[i].rowid;
+    cur->distances[i] = results[i].dist;
+  }
+  cur->nResults = nResults;
+  sqlite3_free(results);
   return SQLITE_OK;
 }
 
@@ -409,9 +559,34 @@ static int vec0Column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx,
   case 0: /* hidden table-name column (MATCH input) — return NULL */
     sqlite3_result_null(ctx);
     break;
-  case 1: /* vector TEXT — fetch from _data in a later commit */
-    sqlite3_result_null(ctx);
+  case 1: { /* vector TEXT — fetch blob from _data and format as [x,y,...] */
+    Vec0Table *p = (Vec0Table *)pCursor->pVtab;
+    char *sql =
+        sqlite3_mprintf("SELECT vector FROM \"%w\".\"%w_data\" WHERE id=%lld",
+                        p->schema, p->name, cur->rowids[cur->pos]);
+    sqlite3_stmt *stmt = NULL;
+    if (sql && sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+      sqlite3_free(sql);
+      if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int bytes = sqlite3_column_bytes(stmt, 0);
+        const float *blob = (const float *)sqlite3_column_blob(stmt, 0);
+        int dims = bytes / (int)sizeof(float);
+        char *text = vec_format(blob, dims);
+        if (text) {
+          sqlite3_result_text(ctx, text, -1, sqlite3_free);
+        } else {
+          sqlite3_result_null(ctx);
+        }
+      } else {
+        sqlite3_result_null(ctx);
+      }
+      sqlite3_finalize(stmt);
+    } else {
+      sqlite3_free(sql);
+      sqlite3_result_null(ctx);
+    }
     break;
+  }
   case 2: /* distance REAL */
     if (cur->distances)
       sqlite3_result_double(ctx, cur->distances[cur->pos]);
@@ -451,8 +626,38 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
   /* DELETE: argc == 1 */
   if (argc == 1) {
-    pVtab->zErrMsg = sqlite3_mprintf("vec0: DELETE not yet supported");
-    return SQLITE_CONSTRAINT;
+    sqlite3_int64 del_rowid = sqlite3_value_int64(argv[0]);
+
+    /* Remove from _data */
+    char *dsql = sqlite3_mprintf("DELETE FROM \"%w\".\"%w_data\" WHERE id=%lld",
+                                 p->schema, p->name, del_rowid);
+    sqlite3_exec(p->db, dsql, NULL, NULL, NULL);
+    sqlite3_free(dsql);
+
+    /* Remove from HNSW graph */
+    HnswCtx hctx;
+    hctx.db = p->db;
+    hctx.schema = p->schema;
+    hctx.tbl_name = p->name;
+    hctx.dims = p->dims;
+    hctx.m = p->m;
+    hctx.ef_construction = p->ef_construction;
+    hctx.ef_search = p->ef_search;
+    hctx.entry_point = p->entry_point;
+    hctx.max_layer = p->max_layer;
+    hctx.dist_fn = p->dist_fn;
+    hnsw_delete(&hctx, del_rowid);
+    p->entry_point = hctx.entry_point;
+    p->max_layer = hctx.max_layer;
+
+    if (p->count > 0)
+      p->count--;
+    char *csql = sqlite3_mprintf(
+        "UPDATE \"%w\".\"%w_config\" SET value='%lld' WHERE key='count'",
+        p->schema, p->name, p->count);
+    sqlite3_exec(p->db, csql, NULL, NULL, NULL);
+    sqlite3_free(csql);
+    return SQLITE_OK;
   }
 
   /* UPDATE: argv[0] is not NULL (existing row being replaced) */
@@ -496,11 +701,12 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
     return rc;
   }
-  sqlite3_bind_blob(stmt, 1, vec, dims * (int)sizeof(float), SQLITE_TRANSIENT);
-  sqlite3_free(vec);
+  /* Use SQLITE_STATIC so vec stays alive until after hnsw_insert. */
+  sqlite3_bind_blob(stmt, 1, vec, dims * (int)sizeof(float), SQLITE_STATIC);
   rc = sqlite3_step(stmt);
   sqlite3_finalize(stmt);
   if (rc != SQLITE_DONE) {
+    sqlite3_free(vec);
     pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
     return SQLITE_ERROR;
   }
@@ -515,7 +721,23 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
   sqlite3_exec(p->db, sql, NULL, NULL, NULL);
   sqlite3_free(sql);
 
-  return SQLITE_OK;
+  /* Insert into HNSW graph */
+  HnswCtx hctx;
+  hctx.db = p->db;
+  hctx.schema = p->schema;
+  hctx.tbl_name = p->name;
+  hctx.dims = p->dims;
+  hctx.m = p->m;
+  hctx.ef_construction = p->ef_construction;
+  hctx.ef_search = p->ef_search;
+  hctx.entry_point = p->entry_point;
+  hctx.max_layer = p->max_layer;
+  hctx.dist_fn = p->dist_fn;
+  rc = hnsw_insert(&hctx, *pRowid, vec);
+  sqlite3_free(vec);
+  p->entry_point = hctx.entry_point;
+  p->max_layer = hctx.max_layer;
+  return rc;
 }
 
 /* ── xShadowName ─────────────────────────────────────────────────────────────
