@@ -14,15 +14,37 @@ SQLITE_EXTENSION_INIT3
  */
 typedef struct HnswCtx {
   sqlite3 *db;
-  const char *schema;   /* schema name (not owned) */
-  const char *tbl_name; /* virtual table name (not owned) */
-  int dims;             /* vector dimensionality */
-  int m;                /* HNSW M: max neighbours per node per layer */
-  int ef_construction;  /* beam width during index build */
-  int ef_search;        /* beam width during query */
+  const char *schema;        /* schema name (not owned) */
+  const char *tbl_name;      /* virtual table name (not owned) */
+  int dims;                  /* vector dimensionality */
+  int m;                     /* HNSW M: max neighbours per node per layer */
+  int ef_construction;       /* beam width during index build */
+  int ef_search;             /* beam width during query */
   sqlite3_int64 entry_point; /* rowid of entry-point node; -1 when empty */
   int max_layer;             /* current top layer */
   dist_fn_t dist_fn;         /* distance kernel (set from metric string) */
+
+  /*
+   * Optional pre-prepared (borrowed) statements — populated by vtab.c from
+   * the Vec0Table statement cache.  If non-NULL, hnsw_* functions use them
+   * directly and skip local prepare/finalize (big win for bulk inserts).
+   * If NULL, each hnsw_* function prepares its own local copies.
+   * The caller owns these; hnsw_* never finalizes them.
+   */
+  sqlite3_stmt *sc_get_nbrs; /* SELECT neighbor_id, distance FROM _graph WHERE
+                                layer=? AND node_id=? */
+  sqlite3_stmt *sc_get_vec;  /* SELECT vector FROM _data WHERE id=? */
+  sqlite3_stmt *sc_ins_edge; /* INSERT OR REPLACE INTO
+                                _graph(layer,node_id,neighbor_id,distance)
+                                VALUES(?,?,?,?) */
+  sqlite3_stmt
+      *sc_del_edges; /* DELETE FROM _graph WHERE layer=? AND node_id=? */
+  sqlite3_stmt *sc_ins_layer; /* INSERT OR REPLACE INTO
+                                 _layers(node_id,max_layer) VALUES(?,?) */
+  sqlite3_stmt *sc_nbr_count; /* SELECT COUNT(*) FROM _graph WHERE layer=? AND
+                                 node_id=? */
+  sqlite3_stmt *sc_rev_nbrs;  /* SELECT DISTINCT node_id FROM _graph WHERE
+                                 layer=? AND neighbor_id=? */
 } HnswCtx;
 
 /*
@@ -58,8 +80,8 @@ int hnsw_insert(HnswCtx *ctx, sqlite3_int64 rowid, const float *vec);
  * Deletes rows from {tbl_name}_layers and all edges touching rowid in
  * {tbl_name}_graph. If the deleted node was the entry_point, a new one is
  * selected. Updates ctx->entry_point / ctx->max_layer and persists to _config.
- * v1: no graph repair — edges just become sparser; traversal skips missing
- * nodes.
+ * v2: graph repair — former neighbours of the deleted node are re-wired by
+ * running a search_layer beam search to find replacement connections.
  */
 int hnsw_delete(HnswCtx *ctx, sqlite3_int64 rowid);
 

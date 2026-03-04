@@ -354,25 +354,32 @@ int hnsw_search(HnswCtx *ctx, const float *query_vec, int k,
   if (ctx->entry_point < 0)
     return SQLITE_OK; /* empty graph */
 
+  int local = (ctx->sc_get_nbrs == NULL);
   char *sql;
   int rc = SQLITE_OK;
   sqlite3_stmt *stmt_get_nbrs = NULL, *stmt_get_vec = NULL;
 
-  sql = sqlite3_mprintf("SELECT neighbor_id, distance FROM \"%w\".\"%w_graph\""
+  if (local) {
+    sql =
+        sqlite3_mprintf("SELECT neighbor_id, distance FROM \"%w\".\"%w_graph\""
                         " WHERE layer=? AND node_id=?",
                         ctx->schema, ctx->tbl_name);
-  rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_nbrs, NULL);
-  sqlite3_free(sql);
-  if (rc != SQLITE_OK)
-    return rc;
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_nbrs, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      return rc;
 
-  sql = sqlite3_mprintf("SELECT vector FROM \"%w\".\"%w_data\" WHERE id=?",
-                        ctx->schema, ctx->tbl_name);
-  rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_vec, NULL);
-  sqlite3_free(sql);
-  if (rc != SQLITE_OK) {
-    sqlite3_finalize(stmt_get_nbrs);
-    return rc;
+    sql = sqlite3_mprintf("SELECT vector FROM \"%w\".\"%w_data\" WHERE id=?",
+                          ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_vec, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK) {
+      sqlite3_finalize(stmt_get_nbrs);
+      return rc;
+    }
+  } else {
+    stmt_get_nbrs = ctx->sc_get_nbrs;
+    stmt_get_vec = ctx->sc_get_vec;
   }
 
   /* Distance from query to entry point */
@@ -452,8 +459,10 @@ int hnsw_search(HnswCtx *ctx, const float *query_vec, int k,
   heap_free(&W0);
 
 cleanup:
-  sqlite3_finalize(stmt_get_nbrs);
-  sqlite3_finalize(stmt_get_vec);
+  if (local) {
+    sqlite3_finalize(stmt_get_nbrs);
+    sqlite3_finalize(stmt_get_vec);
+  }
   return rc;
 }
 
@@ -523,54 +532,73 @@ int hnsw_insert(HnswCtx *ctx, sqlite3_int64 rowid, const float *vec) {
   if (node_level < 0)
     node_level = 0;
 
-  /* Prepare reusable statements */
+  int local = (ctx->sc_get_nbrs == NULL);
   char *sql;
   sqlite3_stmt *stmt_get_nbrs = NULL, *stmt_get_vec = NULL;
   sqlite3_stmt *stmt_ins_edge = NULL, *stmt_del_edges = NULL;
-  sqlite3_stmt *stmt_ins_layer = NULL;
+  sqlite3_stmt *stmt_ins_layer = NULL, *stmt_nbr_count = NULL;
 
-  sql = sqlite3_mprintf("SELECT neighbor_id, distance FROM \"%w\".\"%w_graph\""
+  if (local) {
+    sql =
+        sqlite3_mprintf("SELECT neighbor_id, distance FROM \"%w\".\"%w_graph\""
                         " WHERE layer=? AND node_id=?",
                         ctx->schema, ctx->tbl_name);
-  rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_nbrs, NULL);
-  sqlite3_free(sql);
-  if (rc != SQLITE_OK)
-    return rc;
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_nbrs, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      return rc;
 
-  sql = sqlite3_mprintf("SELECT vector FROM \"%w\".\"%w_data\" WHERE id=?",
-                        ctx->schema, ctx->tbl_name);
-  rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_vec, NULL);
-  sqlite3_free(sql);
-  if (rc != SQLITE_OK)
-    goto cleanup;
+    sql = sqlite3_mprintf("SELECT vector FROM \"%w\".\"%w_data\" WHERE id=?",
+                          ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_vec, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      goto cleanup;
 
-  sql = sqlite3_mprintf(
-      "INSERT OR REPLACE INTO \"%w\".\"%w_graph\""
-      "(layer, node_id, neighbor_id, distance) VALUES (?,?,?,?)",
-      ctx->schema, ctx->tbl_name);
-  rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_ins_edge, NULL);
-  sqlite3_free(sql);
-  if (rc != SQLITE_OK)
-    goto cleanup;
+    sql = sqlite3_mprintf(
+        "INSERT OR REPLACE INTO \"%w\".\"%w_graph\""
+        "(layer, node_id, neighbor_id, distance) VALUES (?,?,?,?)",
+        ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_ins_edge, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      goto cleanup;
 
-  sql = sqlite3_mprintf(
-      "DELETE FROM \"%w\".\"%w_graph\" WHERE layer=? AND node_id=?",
-      ctx->schema, ctx->tbl_name);
-  rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_del_edges, NULL);
-  sqlite3_free(sql);
-  if (rc != SQLITE_OK)
-    goto cleanup;
+    sql = sqlite3_mprintf(
+        "DELETE FROM \"%w\".\"%w_graph\" WHERE layer=? AND node_id=?",
+        ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_del_edges, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      goto cleanup;
 
-  sql = sqlite3_mprintf(
-      "INSERT OR REPLACE INTO \"%w\".\"%w_layers\"(node_id, max_layer)"
-      " VALUES (?,?)",
-      ctx->schema, ctx->tbl_name);
-  rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_ins_layer, NULL);
-  sqlite3_free(sql);
-  if (rc != SQLITE_OK)
-    goto cleanup;
+    sql = sqlite3_mprintf(
+        "INSERT OR REPLACE INTO \"%w\".\"%w_layers\"(node_id, max_layer)"
+        " VALUES (?,?)",
+        ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_ins_layer, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      goto cleanup;
+
+    sql = sqlite3_mprintf(
+        "SELECT COUNT(*) FROM \"%w\".\"%w_graph\" WHERE layer=? AND node_id=?",
+        ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_nbr_count, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      goto cleanup;
+  } else {
+    stmt_get_nbrs = ctx->sc_get_nbrs;
+    stmt_get_vec = ctx->sc_get_vec;
+    stmt_ins_edge = ctx->sc_ins_edge;
+    stmt_del_edges = ctx->sc_del_edges;
+    stmt_ins_layer = ctx->sc_ins_layer;
+    stmt_nbr_count = ctx->sc_nbr_count;
+  }
 
   /* Write this node's max layer to _layers */
+  sqlite3_reset(stmt_ins_layer);
   sqlite3_bind_int64(stmt_ins_layer, 1, rowid);
   sqlite3_bind_int(stmt_ins_layer, 2, node_level);
   rc = sqlite3_step(stmt_ins_layer);
@@ -687,36 +715,30 @@ int hnsw_insert(HnswCtx *ctx, sqlite3_int64 rowid, const float *vec) {
       sqlite3_bind_double(stmt_ins_edge, 4, nbr_dist);
       sqlite3_step(stmt_ins_edge);
 
-      /* Count current out-edges of nbr_id at lc */
-      char *cnt_sql = sqlite3_mprintf("SELECT COUNT(*) FROM \"%w\".\"%w_graph\""
-                                      " WHERE layer=%d AND node_id=%lld",
-                                      ctx->schema, ctx->tbl_name, lc, nbr_id);
-      sqlite3_stmt *stmt_cnt = NULL;
-      sqlite3_prepare_v2(ctx->db, cnt_sql, -1, &stmt_cnt, NULL);
-      sqlite3_free(cnt_sql);
+      /* Count current out-edges of nbr_id at lc using cached/local stmt */
+      sqlite3_reset(stmt_nbr_count);
+      sqlite3_bind_int(stmt_nbr_count, 1, lc);
+      sqlite3_bind_int64(stmt_nbr_count, 2, nbr_id);
       int nbr_conn = 0;
-      if (stmt_cnt && sqlite3_step(stmt_cnt) == SQLITE_ROW)
-        nbr_conn = sqlite3_column_int(stmt_cnt, 0);
-      sqlite3_finalize(stmt_cnt);
+      if (sqlite3_step(stmt_nbr_count) == SQLITE_ROW)
+        nbr_conn = sqlite3_column_int(stmt_nbr_count, 0);
 
       if (nbr_conn > Mmax) {
-        /* Fetch all existing edges for nbr_id and prune to Mmax */
-        char *fetch_sql = sqlite3_mprintf(
-            "SELECT neighbor_id, distance FROM \"%w\".\"%w_graph\""
-            " WHERE layer=%d AND node_id=%lld",
-            ctx->schema, ctx->tbl_name, lc, nbr_id);
-        sqlite3_stmt *stmt_fetch = NULL;
-        sqlite3_prepare_v2(ctx->db, fetch_sql, -1, &stmt_fetch, NULL);
-        sqlite3_free(fetch_sql);
+        /* Fetch all existing edges for nbr_id and prune to Mmax.
+         * Reuse stmt_get_nbrs (search_layer has finished; safe to reset). */
+        sqlite3_reset(stmt_get_nbrs);
+        sqlite3_bind_int(stmt_get_nbrs, 1, lc);
+        sqlite3_bind_int64(stmt_get_nbrs, 2, nbr_id);
 
         Heap nbr_W;
         heap_init(&nbr_W);
-        while (stmt_fetch && sqlite3_step(stmt_fetch) == SQLITE_ROW) {
-          sqlite3_int64 nid = sqlite3_column_int64(stmt_fetch, 0);
-          double nd = sqlite3_column_double(stmt_fetch, 1);
+        while (sqlite3_step(stmt_get_nbrs) == SQLITE_ROW) {
+          sqlite3_int64 nid = sqlite3_column_int64(stmt_get_nbrs, 0);
+          double nd = sqlite3_column_double(stmt_get_nbrs, 1);
           maxheap_push(&nbr_W, nid, nd);
         }
-        sqlite3_finalize(stmt_fetch);
+        /* Reset so stmt_get_nbrs is clean for next search_layer call */
+        sqlite3_reset(stmt_get_nbrs);
 
         set_connections(ctx, lc, nbr_id, &nbr_W, Mmax, stmt_ins_edge,
                         stmt_del_edges);
@@ -744,60 +766,264 @@ int hnsw_insert(HnswCtx *ctx, sqlite3_int64 rowid, const float *vec) {
   }
 
 cleanup:
-  sqlite3_finalize(stmt_get_nbrs);
-  sqlite3_finalize(stmt_get_vec);
-  sqlite3_finalize(stmt_ins_edge);
-  sqlite3_finalize(stmt_del_edges);
-  sqlite3_finalize(stmt_ins_layer);
+  if (local) {
+    sqlite3_finalize(stmt_get_nbrs);
+    sqlite3_finalize(stmt_get_vec);
+    sqlite3_finalize(stmt_ins_edge);
+    sqlite3_finalize(stmt_del_edges);
+    sqlite3_finalize(stmt_ins_layer);
+    sqlite3_finalize(stmt_nbr_count);
+  }
   return rc;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
- * hnsw_delete — v1: remove node + edges, no graph repair.
+ * hnsw_delete — v2: remove node + edges, then repair affected neighbours.
+ *
+ * Repair: For each node N that had a forward edge N→D at some layer lc,
+ * we run a search_layer beam search to find replacement connections and
+ * call set_connections to re-wire N at that layer.
  * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Per-layer repair target: node N that lost an edge to deleted D. */
+typedef struct {
+  int lc;
+  sqlite3_int64 nid;
+} RepairTarget;
+
 int hnsw_delete(HnswCtx *ctx, sqlite3_int64 rowid) {
   char *sql;
   int rc = SQLITE_OK;
 
-  /* Delete from _layers */
+  int local = (ctx->sc_get_nbrs == NULL);
+  sqlite3_stmt *stmt_get_nbrs = NULL, *stmt_get_vec = NULL;
+  sqlite3_stmt *stmt_ins_edge = NULL, *stmt_del_edges = NULL;
+  sqlite3_stmt *stmt_rev_nbrs = NULL;
+
+  if (local) {
+    sql =
+        sqlite3_mprintf("SELECT neighbor_id, distance FROM \"%w\".\"%w_graph\""
+                        " WHERE layer=? AND node_id=?",
+                        ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_nbrs, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      return rc;
+
+    sql = sqlite3_mprintf("SELECT vector FROM \"%w\".\"%w_data\" WHERE id=?",
+                          ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_get_vec, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      goto cleanup;
+
+    sql = sqlite3_mprintf(
+        "INSERT OR REPLACE INTO \"%w\".\"%w_graph\""
+        "(layer, node_id, neighbor_id, distance) VALUES (?,?,?,?)",
+        ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_ins_edge, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      goto cleanup;
+
+    sql = sqlite3_mprintf(
+        "DELETE FROM \"%w\".\"%w_graph\" WHERE layer=? AND node_id=?",
+        ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_del_edges, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      goto cleanup;
+
+    sql = sqlite3_mprintf("SELECT DISTINCT node_id FROM \"%w\".\"%w_graph\""
+                          " WHERE layer=? AND neighbor_id=?",
+                          ctx->schema, ctx->tbl_name);
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt_rev_nbrs, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK)
+      goto cleanup;
+  } else {
+    stmt_get_nbrs = ctx->sc_get_nbrs;
+    stmt_get_vec = ctx->sc_get_vec;
+    stmt_ins_edge = ctx->sc_ins_edge;
+    stmt_del_edges = ctx->sc_del_edges;
+    stmt_rev_nbrs = ctx->sc_rev_nbrs;
+  }
+
+  /* ── Step 1: Get deleted node's max layer (before removing from _layers) ──
+   */
+  int d_max_layer = 0;
+  {
+    char *lsql = sqlite3_mprintf(
+        "SELECT max_layer FROM \"%w\".\"%w_layers\" WHERE node_id=%lld",
+        ctx->schema, ctx->tbl_name, rowid);
+    sqlite3_stmt *lstmt = NULL;
+    if (sqlite3_prepare_v2(ctx->db, lsql, -1, &lstmt, NULL) == SQLITE_OK) {
+      if (sqlite3_step(lstmt) == SQLITE_ROW)
+        d_max_layer = sqlite3_column_int(lstmt, 0);
+      sqlite3_finalize(lstmt);
+    }
+    sqlite3_free(lsql);
+  }
+
+  /* ── Step 2: Collect repair targets before edge deletion ─────────────── */
+  /* For each layer lc, collect nodes N that had D as a forward neighbor
+   * (i.e., N→D edge exists): SELECT DISTINCT node_id WHERE neighbor_id=D.
+   * These nodes lose a direct connection and will be re-wired. */
+  RepairTarget *repairs = NULL;
+  int n_repairs = 0;
+  int cap_repairs = 0;
+
+  for (int lc = 0; lc <= d_max_layer; lc++) {
+    sqlite3_reset(stmt_rev_nbrs);
+    sqlite3_bind_int(stmt_rev_nbrs, 1, lc);
+    sqlite3_bind_int64(stmt_rev_nbrs, 2, rowid);
+    while (sqlite3_step(stmt_rev_nbrs) == SQLITE_ROW) {
+      sqlite3_int64 nid = sqlite3_column_int64(stmt_rev_nbrs, 0);
+      if (nid == rowid)
+        continue;
+      if (n_repairs == cap_repairs) {
+        int ncap = cap_repairs ? cap_repairs * 2 : 16;
+        RepairTarget *nd =
+            sqlite3_realloc(repairs, ncap * (int)sizeof(RepairTarget));
+        if (!nd) {
+          rc = SQLITE_NOMEM;
+          goto cleanup;
+        }
+        repairs = nd;
+        cap_repairs = ncap;
+      }
+      repairs[n_repairs].lc = lc;
+      repairs[n_repairs].nid = nid;
+      n_repairs++;
+    }
+  }
+
+  /* ── Step 3: Delete from _layers ─────────────────────────────────────── */
+  /* Reset stmt_rev_nbrs so it releases any shared read lock before we write */
+  sqlite3_reset(stmt_rev_nbrs);
   sql = sqlite3_mprintf("DELETE FROM \"%w\".\"%w_layers\" WHERE node_id=%lld",
                         ctx->schema, ctx->tbl_name, rowid);
   rc = sqlite3_exec(ctx->db, sql, NULL, NULL, NULL);
   sqlite3_free(sql);
   if (rc != SQLITE_OK)
-    return rc;
+    goto cleanup;
 
-  /* Delete all graph edges touching this node */
+  /* ── Step 4: Delete all graph edges touching this node ───────────────── */
   sql = sqlite3_mprintf("DELETE FROM \"%w\".\"%w_graph\""
                         " WHERE node_id=%lld OR neighbor_id=%lld",
                         ctx->schema, ctx->tbl_name, rowid, rowid);
   rc = sqlite3_exec(ctx->db, sql, NULL, NULL, NULL);
   sqlite3_free(sql);
   if (rc != SQLITE_OK)
-    return rc;
+    goto cleanup;
 
-  /* If this was the entry point, elect a new one */
+  /* ── Step 5: Entry-point election ────────────────────────────────────── */
   if (ctx->entry_point == rowid) {
     sql = sqlite3_mprintf("SELECT node_id, max_layer FROM \"%w\".\"%w_layers\""
                           " ORDER BY max_layer DESC LIMIT 1",
                           ctx->schema, ctx->tbl_name);
-    sqlite3_stmt *stmt = NULL;
-    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &stmt, NULL);
+    sqlite3_stmt *ep_stmt = NULL;
+    rc = sqlite3_prepare_v2(ctx->db, sql, -1, &ep_stmt, NULL);
     sqlite3_free(sql);
     if (rc == SQLITE_OK) {
-      if (sqlite3_step(stmt) == SQLITE_ROW) {
-        ctx->entry_point = sqlite3_column_int64(stmt, 0);
-        ctx->max_layer = sqlite3_column_int(stmt, 1);
+      if (sqlite3_step(ep_stmt) == SQLITE_ROW) {
+        ctx->entry_point = sqlite3_column_int64(ep_stmt, 0);
+        ctx->max_layer = sqlite3_column_int(ep_stmt, 1);
       } else {
-        /* Graph is now empty */
         ctx->entry_point = -1;
         ctx->max_layer = 0;
       }
-      sqlite3_finalize(stmt);
+      sqlite3_finalize(ep_stmt);
     }
     update_config(ctx, "entry_point", ctx->entry_point);
     update_config(ctx, "max_layer", (sqlite3_int64)ctx->max_layer);
   }
 
-  return SQLITE_OK;
+  /* ── Step 6: Graph repair ─────────────────────────────────────────────── */
+  if (ctx->entry_point >= 0 && n_repairs > 0) {
+    float *n_vec_copy = sqlite3_malloc(ctx->dims * (int)sizeof(float));
+    if (!n_vec_copy) {
+      rc = SQLITE_NOMEM;
+      goto cleanup;
+    }
+
+    for (int i = 0; i < n_repairs && rc == SQLITE_OK; i++) {
+      int lc = repairs[i].lc;
+      sqlite3_int64 nid = repairs[i].nid;
+
+      /* Fetch N's vector */
+      const float *n_raw = NULL;
+      if (fetch_vector_stmt(stmt_get_vec, nid, &n_raw, ctx->dims) != SQLITE_OK)
+        continue; /* node missing or wrong dims — skip */
+      memcpy(n_vec_copy, n_raw, ctx->dims * (int)sizeof(float));
+
+      /* Fetch entry point's vector to compute distance for search_layer */
+      const float *ep_raw = NULL;
+      if (fetch_vector_stmt(stmt_get_vec, ctx->entry_point, &ep_raw,
+                            ctx->dims) != SQLITE_OK)
+        continue;
+      double ep_dist = 0.0;
+      ctx->dist_fn(n_vec_copy, ep_raw, ctx->dims, &ep_dist);
+
+      /* Search at layer lc for replacement neighbours */
+      Heap W;
+      rc = heap_init(&W);
+      if (rc != SQLITE_OK)
+        break;
+
+      rc = search_layer(ctx, n_vec_copy, ctx->entry_point, ep_dist,
+                        ctx->ef_construction, lc, stmt_get_nbrs, stmt_get_vec,
+                        &W);
+
+      if (rc == SQLITE_OK && W.len > 0) {
+        int Mmax = (lc == 0) ? ctx->m * 2 : ctx->m;
+
+        /* Re-wire N's forward edges at lc */
+        rc = set_connections(ctx, lc, nid, &W, Mmax, stmt_ins_edge,
+                             stmt_del_edges);
+
+        /* Add reverse edges: each selected neighbour X → N */
+        if (rc == SQLITE_OK) {
+          int ntmp = W.len;
+          HNode *tmp = sqlite3_malloc(ntmp * (int)sizeof(HNode));
+          if (tmp) {
+            memcpy(tmp, W.data, ntmp * (int)sizeof(HNode));
+            /* Sort ascending by distance */
+            for (int j = 1; j < ntmp; j++) {
+              HNode key = tmp[j];
+              int kk = j - 1;
+              while (kk >= 0 && tmp[kk].dist > key.dist) {
+                tmp[kk + 1] = tmp[kk];
+                kk--;
+              }
+              tmp[kk + 1] = key;
+            }
+            int nconn = ntmp < Mmax ? ntmp : Mmax;
+            for (int j = 0; j < nconn; j++) {
+              sqlite3_reset(stmt_ins_edge);
+              sqlite3_bind_int(stmt_ins_edge, 1, lc);
+              sqlite3_bind_int64(stmt_ins_edge, 2, tmp[j].id);
+              sqlite3_bind_int64(stmt_ins_edge, 3, nid);
+              sqlite3_bind_double(stmt_ins_edge, 4, tmp[j].dist);
+              sqlite3_step(stmt_ins_edge);
+            }
+            sqlite3_free(tmp);
+          }
+        }
+      }
+      heap_free(&W);
+    }
+    sqlite3_free(n_vec_copy);
+  }
+
+cleanup:
+  sqlite3_free(repairs);
+  if (local) {
+    sqlite3_finalize(stmt_get_nbrs);
+    sqlite3_finalize(stmt_get_vec);
+    sqlite3_finalize(stmt_ins_edge);
+    sqlite3_finalize(stmt_del_edges);
+    sqlite3_finalize(stmt_rev_nbrs);
+  }
+  return rc;
 }

@@ -28,6 +28,23 @@ struct Vec0Table {
   int max_layer;             /* Maximum layer in the HNSW graph */
   sqlite3_int64 count;       /* Number of vectors stored */
   dist_fn_t dist_fn; /* Distance kernel (set from metric at init time) */
+
+  /* Cached prepared statements — prepared once in xCreate/xConnect,
+   * finalized in xDisconnect/xDestroy.  Passed to hnsw_* via HnswCtx
+   * to avoid per-call sqlite3_prepare_v2/sqlite3_finalize overhead. */
+  sqlite3_stmt *sc_get_nbrs; /* SELECT neighbor_id, distance FROM _graph WHERE
+                                layer=? AND node_id=? */
+  sqlite3_stmt *sc_get_vec;  /* SELECT vector FROM _data WHERE id=? */
+  sqlite3_stmt
+      *sc_ins_edge; /* INSERT OR REPLACE INTO _graph(...) VALUES(?,?,?,?) */
+  sqlite3_stmt
+      *sc_del_edges; /* DELETE FROM _graph WHERE layer=? AND node_id=? */
+  sqlite3_stmt *sc_ins_layer; /* INSERT OR REPLACE INTO
+                                 _layers(node_id,max_layer) VALUES(?,?) */
+  sqlite3_stmt *sc_nbr_count; /* SELECT COUNT(*) FROM _graph WHERE layer=? AND
+                                 node_id=? */
+  sqlite3_stmt *sc_rev_nbrs;  /* SELECT DISTINCT node_id FROM _graph WHERE
+                                 layer=? AND neighbor_id=? */
 };
 
 typedef struct Vec0Cursor Vec0Cursor;
@@ -58,7 +75,82 @@ static void vec0_free(Vec0Table *p) {
   sqlite3_free(p->name);
   sqlite3_free(p->schema);
   sqlite3_free(p->metric);
+  sqlite3_finalize(p->sc_get_nbrs);
+  sqlite3_finalize(p->sc_get_vec);
+  sqlite3_finalize(p->sc_ins_edge);
+  sqlite3_finalize(p->sc_del_edges);
+  sqlite3_finalize(p->sc_ins_layer);
+  sqlite3_finalize(p->sc_nbr_count);
+  sqlite3_finalize(p->sc_rev_nbrs);
   sqlite3_free(p);
+}
+
+/* Prepare the seven shared HNSW statements and store them on the Vec0Table.
+ * Called from vec0Init after name/schema are set and shadow tables exist. */
+static int vec0_prepare_stmts(Vec0Table *p, char **pzErr) {
+  char *sql;
+  int rc;
+
+#define PREP(field, fmt, ...)                                                  \
+  do {                                                                         \
+    sql = sqlite3_mprintf(fmt, ##__VA_ARGS__);                                 \
+    rc = sqlite3_prepare_v2(p->db, sql, -1, &p->field, NULL);                  \
+    sqlite3_free(sql);                                                         \
+    if (rc != SQLITE_OK) {                                                     \
+      if (pzErr)                                                               \
+        *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));                 \
+      return rc;                                                               \
+    }                                                                          \
+  } while (0)
+
+  PREP(sc_get_nbrs,
+       "SELECT neighbor_id, distance FROM \"%w\".\"%w_graph\""
+       " WHERE layer=? AND node_id=?",
+       p->schema, p->name);
+  PREP(sc_get_vec, "SELECT vector FROM \"%w\".\"%w_data\" WHERE id=?",
+       p->schema, p->name);
+  PREP(sc_ins_edge,
+       "INSERT OR REPLACE INTO \"%w\".\"%w_graph\""
+       "(layer, node_id, neighbor_id, distance) VALUES (?,?,?,?)",
+       p->schema, p->name);
+  PREP(sc_del_edges,
+       "DELETE FROM \"%w\".\"%w_graph\" WHERE layer=? AND node_id=?", p->schema,
+       p->name);
+  PREP(sc_ins_layer,
+       "INSERT OR REPLACE INTO \"%w\".\"%w_layers\"(node_id, max_layer)"
+       " VALUES (?,?)",
+       p->schema, p->name);
+  PREP(sc_nbr_count,
+       "SELECT COUNT(*) FROM \"%w\".\"%w_graph\" WHERE layer=? AND node_id=?",
+       p->schema, p->name);
+  PREP(sc_rev_nbrs,
+       "SELECT DISTINCT node_id FROM \"%w\".\"%w_graph\""
+       " WHERE layer=? AND neighbor_id=?",
+       p->schema, p->name);
+
+#undef PREP
+  return SQLITE_OK;
+}
+
+/* Populate an HnswCtx from the Vec0Table, including cached stmt pointers. */
+static void vec0_make_hctx(Vec0Table *p, HnswCtx *out) {
+  out->db = p->db;
+  out->schema = p->schema;
+  out->tbl_name = p->name;
+  out->dims = p->dims;
+  out->m = p->m;
+  out->ef_construction = p->ef_construction;
+  out->ef_search = p->ef_search;
+  out->entry_point = p->entry_point;
+  out->max_layer = p->max_layer;
+  out->dist_fn = p->dist_fn;
+  out->sc_get_nbrs = p->sc_get_nbrs;
+  out->sc_get_vec = p->sc_get_vec;
+  out->sc_ins_edge = p->sc_ins_edge;
+  out->sc_del_edges = p->sc_del_edges;
+  out->sc_ins_layer = p->sc_ins_layer;
+  out->sc_nbr_count = p->sc_nbr_count;
+  out->sc_rev_nbrs = p->sc_rev_nbrs;
 }
 
 /* ── Shadow table helpers ─────────────────────────────────────────────────
@@ -270,6 +362,15 @@ static int vec0Init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
 
   {
     int rc = vec0_declare(db, p->name, pzErr);
+    if (rc != SQLITE_OK) {
+      vec0_free(p);
+      return rc;
+    }
+  }
+
+  /* Prepare shared HNSW statements (shadow tables must exist at this point) */
+  {
+    int rc = vec0_prepare_stmts(p, pzErr);
     if (rc != SQLITE_OK) {
       vec0_free(p);
       return rc;
@@ -591,15 +692,8 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   }
 
   HnswCtx hctx;
-  hctx.db = p->db;
-  hctx.schema = p->schema;
-  hctx.tbl_name = p->name;
-  hctx.dims = p->dims;
-  hctx.m = p->m;
-  hctx.ef_construction = p->ef_construction;
+  vec0_make_hctx(p, &hctx);
   hctx.ef_search = ef; /* per-query override or table default */
-  hctx.entry_point = p->entry_point;
-  hctx.max_layer = p->max_layer;
   hctx.dist_fn = knn_dist_fn;
 
   HnswResult *results = NULL;
@@ -735,16 +829,7 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
     /* Remove from HNSW graph */
     HnswCtx hctx;
-    hctx.db = p->db;
-    hctx.schema = p->schema;
-    hctx.tbl_name = p->name;
-    hctx.dims = p->dims;
-    hctx.m = p->m;
-    hctx.ef_construction = p->ef_construction;
-    hctx.ef_search = p->ef_search;
-    hctx.entry_point = p->entry_point;
-    hctx.max_layer = p->max_layer;
-    hctx.dist_fn = p->dist_fn;
+    vec0_make_hctx(p, &hctx);
     hnsw_delete(&hctx, del_rowid);
     p->entry_point = hctx.entry_point;
     p->max_layer = hctx.max_layer;
@@ -795,16 +880,7 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     sqlite3_free(dsql);
 
     HnswCtx del_ctx;
-    del_ctx.db = p->db;
-    del_ctx.schema = p->schema;
-    del_ctx.tbl_name = p->name;
-    del_ctx.dims = p->dims;
-    del_ctx.m = p->m;
-    del_ctx.ef_construction = p->ef_construction;
-    del_ctx.ef_search = p->ef_search;
-    del_ctx.entry_point = p->entry_point;
-    del_ctx.max_layer = p->max_layer;
-    del_ctx.dist_fn = p->dist_fn;
+    vec0_make_hctx(p, &del_ctx);
     hnsw_delete(&del_ctx, old_rowid);
     p->entry_point = del_ctx.entry_point;
     p->max_layer = del_ctx.max_layer;
@@ -845,16 +921,10 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
     /* Re-insert into HNSW graph */
     HnswCtx ins_ctx;
-    ins_ctx.db = p->db;
-    ins_ctx.schema = p->schema;
-    ins_ctx.tbl_name = p->name;
-    ins_ctx.dims = p->dims;
-    ins_ctx.m = p->m;
-    ins_ctx.ef_construction = p->ef_construction;
-    ins_ctx.ef_search = p->ef_search;
+    vec0_make_hctx(p, &ins_ctx);
+    /* entry_point/max_layer were updated by hnsw_delete above */
     ins_ctx.entry_point = p->entry_point;
     ins_ctx.max_layer = p->max_layer;
-    ins_ctx.dist_fn = p->dist_fn;
     upd_rc = hnsw_insert(&ins_ctx, old_rowid, upd_vec);
     sqlite3_free(upd_vec);
     p->entry_point = ins_ctx.entry_point;
@@ -919,16 +989,7 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
   /* Insert into HNSW graph */
   HnswCtx hctx;
-  hctx.db = p->db;
-  hctx.schema = p->schema;
-  hctx.tbl_name = p->name;
-  hctx.dims = p->dims;
-  hctx.m = p->m;
-  hctx.ef_construction = p->ef_construction;
-  hctx.ef_search = p->ef_search;
-  hctx.entry_point = p->entry_point;
-  hctx.max_layer = p->max_layer;
-  hctx.dist_fn = p->dist_fn;
+  vec0_make_hctx(p, &hctx);
   rc = hnsw_insert(&hctx, *pRowid, vec);
   sqlite3_free(vec);
   p->entry_point = hctx.entry_point;

@@ -38,28 +38,41 @@ SELECT rowid, distance FROM items WHERE items MATCH vec('[0.1, ...]') LIMIT 10;
 - **`src/hnsw.{h,c}`** — Full SQL-native HNSW: `hnsw_search`, `hnsw_insert`,
   `hnsw_delete`. All graph state in shadow tables; C heap holds only candidate
   heaps (O(ef) nodes). Binary min/max-heaps + sorted visited set. Random-level
-  sampling, bidirectional edge pruning, entry-point election on delete (v1: no
-  graph repair).
+  sampling, bidirectional edge pruning, entry-point election on delete. v2 graph
+  repair on delete: former neighbours are re-wired by running a `search_layer`
+  beam search at each affected layer, then calling `set_connections` to restore
+  up to M connections and adding reverse edges. Optional pre-prepared statement
+  cache (`sc_*` fields in `HnswCtx`, populated from `Vec0Table`) eliminates
+  `sqlite3_prepare_v2`/`sqlite3_finalize` on every call — critical for
+  bulk-insert throughput.
 - **`src/vtab.{h,c}`** — Complete `sqlite3_module` (iVersion=3):
   `xCreate`/`xConnect`/`xDisconnect`/`xDestroy` (4 shadow tables + config
-  persistence); `xBestIndex` (MATCH → kNN, rowid-eq → point lookup, op 151-156 →
-  metric-override kNN, full-scan fallback); `xFilter` calling `hnsw_search` with
-  per-function metric override; full-scan (idxNum=0) reads all rowids from
-  `_data`; `xColumn` fetching vector BLOBs as `[x,y,z]` text; `xUpdate` for
-  INSERT (→ `hnsw_insert`), DELETE (→ `hnsw_delete`), and UPDATE (delete +
-  re-insert, rowid-change rejected with SQLITE_MISMATCH); `xFindFunction`
-  intercepting all six `vec_distance_*` functions on vtab columns to route them
-  as index-accelerated kNN (idxNum 151-156: l2, cosine, ip, l1, hamming,
-  jaccard); `xShadowName`.
-- **Tests** (all 10 passing via `test/run_all.sh`): `basic.sql`,
+  persistence + 7 cached prepared statements on `Vec0Table`); `xBestIndex`
+  (MATCH → kNN, rowid-eq → point lookup, op 151-156 → metric-override kNN,
+  full-scan fallback); `xFilter` calling `hnsw_search` with per-function metric
+  override; full-scan (idxNum=0) reads all rowids from `_data`; `xColumn`
+  fetching vector BLOBs as `[x,y,z]` text; `xUpdate` for INSERT (→
+  `hnsw_insert`), DELETE (→ `hnsw_delete`), and UPDATE (delete + re-insert,
+  rowid-change rejected with SQLITE_MISMATCH); `xFindFunction` intercepting all
+  six `vec_distance_*` functions on vtab columns to route them as index-
+  accelerated kNN (idxNum 151-156: l2, cosine, ip, l1, hamming, jaccard);
+  `xShadowName`.
+- **Tests** (all 12 passing via `test/run_all.sh`): `basic.sql`,
   `vec_parse.sql`, `distance.sql`, `shadow.sql`, `insert.sql`, `ffi_test.lua`,
   `shadow_connect` (xConnect persistence), `knn.sql` (kNN
-  ordering/DELETE/UPDATE), `operators.sql` (all 6 `vec_distance_*` operator
-  aliases via xFindFunction), `recall_bench.lua` (HNSW recall@k vs brute-force
-  ground truth).
+  ordering/DELETE/UPDATE/ef_search), `operators.sql` (all 6 `vec_distance_*`
+  operator aliases via xFindFunction), `bulk_insert.sql` (BEGIN/COMMIT bulk
+  insert + ROLLBACK correctness), `delete_repair.sql` (graph repair: entry-point
+  deletion, interior-hub deletion, chained deletes), `recall_bench.lua` (HNSW
+  recall@k vs brute-force ground truth).
 
-**Not yet built:** graph repair on delete (v1 leaves edges sparser); batch
-import / bulk-load optimisation; `ef_search` runtime override via SQL.
+**Not yet built:** ~~graph repair on delete~~ (done: v2 re-wires affected
+neighbours via `search_layer` + `set_connections` after each delete); ~~batch
+import / bulk-load optimisation~~ (done: prepared-statement cache on `Vec0Table`
+eliminates 5–7 `sqlite3_prepare_v2`/`sqlite3_finalize` calls per row;
+`BEGIN`/`COMMIT` wrapping already gives bulk-load benefits); ~~`ef_search`
+runtime override via SQL~~ (done: hidden `ef_search` column). Nothing remains on
+the original plan.
 
 ---
 
