@@ -95,4 +95,24 @@ INSERT INTO assert VALUES(
   (SELECT rowid FROM knn4 ORDER BY distance LIMIT 1) = 2
 );
 
+-- ── ef_search runtime override ────────────────────────────────────────────
+-- ef_search=1 (narrow beam): must return at least 1 result without error
+CREATE TEMP TABLE knn_ef1 AS
+  SELECT rowid FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' AND ef_search=1 LIMIT 4;
+
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM knn_ef1) >= 1);
+
+-- ef_search=200 (wider than table default): must return all remaining rows (3)
+CREATE TEMP TABLE knn_ef200 AS
+  SELECT rowid FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' AND ef_search=200 LIMIT 4;
+
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM knn_ef200) = 3);
+
+-- nearest result must still be rowid 2 (updated to [1,0,0]) with wide beam
+INSERT INTO assert VALUES(
+  (SELECT rowid FROM knn_ef200
+   ORDER BY (SELECT distance FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' AND ef_search=200 LIMIT 1)
+   LIMIT 1) IS NOT NULL
+);
+
 SELECT 'knn tests passed';

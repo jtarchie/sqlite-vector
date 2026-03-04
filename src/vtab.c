@@ -68,7 +68,9 @@ static void vec0_free(Vec0Table *p) {
  * xConnect before returning. */
 static int vec0_declare(sqlite3 *db, const char *name, char **pzErr) {
   char *schema = sqlite3_mprintf(
-      "CREATE TABLE x(\"%w\" HIDDEN, vector TEXT, distance REAL HIDDEN)", name);
+      "CREATE TABLE x(\"%w\" HIDDEN, vector TEXT, distance REAL HIDDEN,"
+      " ef_search INTEGER HIDDEN)",
+      name);
   if (!schema)
     return SQLITE_NOMEM;
   int rc = sqlite3_declare_vtab(db, schema);
@@ -363,6 +365,22 @@ static void op_dist_fn(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   (void)pVtab;
 
+/* Helper: look for an EQ constraint on col 3 (ef_search HIDDEN) and, if
+ * found, assign it argvIndex 2 so xFilter receives it as argv[1]. */
+#define ASSIGN_EF_SEARCH_ARG()                                                 \
+  do {                                                                         \
+    for (int _j = 0; _j < pInfo->nConstraint; _j++) {                          \
+      if (!pInfo->aConstraint[_j].usable)                                      \
+        continue;                                                              \
+      if (pInfo->aConstraint[_j].iColumn == 3 &&                               \
+          pInfo->aConstraint[_j].op == SQLITE_INDEX_CONSTRAINT_EQ) {           \
+        pInfo->aConstraintUsage[_j].argvIndex = 2;                             \
+        pInfo->aConstraintUsage[_j].omit = 1;                                  \
+        break;                                                                 \
+      }                                                                        \
+    }                                                                          \
+  } while (0)
+
   /* 0. Operator-alias kNN constraints (op 151-156, set by xFindFunction). */
   for (int i = 0; i < pInfo->nConstraint; i++) {
     if (!pInfo->aConstraint[i].usable)
@@ -371,6 +389,7 @@ static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     if (op >= 151 && op <= 156) {
       pInfo->aConstraintUsage[i].argvIndex = 1;
       pInfo->aConstraintUsage[i].omit = 1;
+      ASSIGN_EF_SEARCH_ARG();
       pInfo->idxNum =
           op; /* 151=l2 152=cosine 153=ip 154=l1 155=hamming 156=jaccard */
       pInfo->estimatedCost = 10.0;
@@ -389,6 +408,7 @@ static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
       pInfo->aConstraintUsage[i].argvIndex =
           1; /* query vector → xFilter argv[0] */
       pInfo->aConstraintUsage[i].omit = 1;
+      ASSIGN_EF_SEARCH_ARG();
       pInfo->idxNum = 1; /* kNN path */
       pInfo->estimatedCost = 10.0;
       pInfo->estimatedRows = 10;
@@ -548,13 +568,17 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
     return SQLITE_ERROR;
   }
 
-  /* Default k: from LIMIT argv[1] if present, else ef_search */
-  int k = p->ef_search;
+  /* ef_search: use per-query override from argv[1] (col 3 EQ), else table
+   * default */
+  int ef = p->ef_search;
   if (argc >= 2 && sqlite3_value_type(argv[1]) == SQLITE_INTEGER) {
-    int lim = sqlite3_value_int(argv[1]);
-    if (lim > 0)
-      k = lim;
+    int v = sqlite3_value_int(argv[1]);
+    if (v > 0)
+      ef = v;
   }
+  /* k = ef_search so the beam covers at least as many candidates as requested;
+   * SQLite's native LIMIT trims the final output row count. */
+  int k = ef;
 
   /* Resolve distance function: operator alias overrides table metric */
   dist_fn_t knn_dist_fn = p->dist_fn;
@@ -573,7 +597,7 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   hctx.dims = p->dims;
   hctx.m = p->m;
   hctx.ef_construction = p->ef_construction;
-  hctx.ef_search = p->ef_search;
+  hctx.ef_search = ef; /* per-query override or table default */
   hctx.entry_point = p->entry_point;
   hctx.max_layer = p->max_layer;
   hctx.dist_fn = knn_dist_fn;
