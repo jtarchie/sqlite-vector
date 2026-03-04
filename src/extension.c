@@ -3,6 +3,7 @@
 
 SQLITE_EXTENSION_INIT1
 
+#include "vec_parse.h"
 #include "vtab.h"
 
 #ifdef _WIN32
@@ -15,5 +16,9 @@ int sqlite3_sqlitevector_init(sqlite3 *db, char **pzErrMsg,
   (void)pzErrMsg;
 
   rc = sqlite3_create_module_v2(db, VEC0_MODULE_NAME, &vec0Module, NULL, NULL);
+  if (rc != SQLITE_OK)
+    return rc;
+
+  rc = vec_register_functions(db);
   return rc;
 }

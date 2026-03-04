@@ -32,20 +32,26 @@ SELECT rowid, distance FROM items WHERE items MATCH vec('[0.1, ...]') LIMIT 10;
 - `third_party/simsimd` — git submodule (ashvardanian/SimSIMD, header-only,
   Apache-2.0)
 - `src/extension.c` — `sqlite3_sqlitevector_init` entry point; registers `vec0`
-  module
-- `src/vtab.h` — `Vec0Module` extern declaration, `VEC0_MODULE_NAME` constant
+  module and all scalar functions
+- `src/vtab.h` — `vec0Module` extern declaration, `VEC0_MODULE_NAME` constant
 - `src/vtab.c` — `sqlite3_module` with `iVersion=3`; `xCreate`/`xConnect` parse
   `dims`, `metric`, `m`, `ef_construction`, `ef_search` from argv; dynamic
   schema declares hidden table-name col at index 0 (enables `MATCH` syntax);
   `xBestIndex` routes `MATCH` on col 0 → `idxNum=1`; `xShadowName` guards
   `config`/`data`/`graph`/`layers`; `xUpdate=NULL` (read-only)
+- `src/vec_parse.h` + `src/vec_parse.c` — `vec_parse()` tokenises `[x,y,z]` text
+  into a `float*` (sqlite3_malloc'd); `vec_format()` serialises back; SQL scalar
+  functions: `vec(text)` (validate + normalise), `vec_dims(text)` (dimension
+  count), `vec_norm(text)` (L2 norm via pure-C loop)
 - `test/basic.sql` — smoke test: extension loads, `CREATE VIRTUAL TABLE`,
   `MATCH` query returns empty without error
+- `test/vec_parse.sql` — assertions for `vec()`, `vec_dims()`, `vec_norm()`:
+  round-trip normalisation, whitespace tolerance, 3-4-5 norm, NULL passthrough
 - `.gitignore` — excludes `build/`, `.xmake/`, compiled artifacts
 
-**Not yet built:** `vec_parse.c`, `distance.c`, `hnsw.c`, shadow table creation
-in `xCreate`/`xDestroy`, config read in `xConnect`, `xUpdate` (INSERT/DELETE),
-kNN search in `xFilter`.
+**Not yet built:** `distance.c`, `hnsw.c`, shadow table creation in
+`xCreate`/`xDestroy`, config read in `xConnect`, `xUpdate` (INSERT/DELETE), kNN
+search in `xFilter`.
 
 ---
 

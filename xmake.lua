@@ -33,4 +33,5 @@ end
 
 if is_plat("linux") then
     add_cflags("-fPIC")
+    add_links("m") -- sqrt etc. from libm
 end
