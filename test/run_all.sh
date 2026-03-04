@@ -35,5 +35,6 @@ run "ffi"            luajit test/ffi_test.lua
 run "shadow_connect" sh test/wrappers/run_shadow_connect.sh
 run "knn"            sqlite3 :memory: < test/knn.sql
 run "operators"      sqlite3 :memory: < test/operators.sql
+run "recall"         luajit test/recall_bench.lua
 
 echo "==> All tests passed."

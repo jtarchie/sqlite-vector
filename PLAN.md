@@ -42,22 +42,24 @@ SELECT rowid, distance FROM items WHERE items MATCH vec('[0.1, ...]') LIMIT 10;
   graph repair).
 - **`src/vtab.{h,c}`** — Complete `sqlite3_module` (iVersion=3):
   `xCreate`/`xConnect`/`xDisconnect`/`xDestroy` (4 shadow tables + config
-  persistence); `xBestIndex` (MATCH → kNN, rowid-eq → point lookup, op 151-154 →
+  persistence); `xBestIndex` (MATCH → kNN, rowid-eq → point lookup, op 151-156 →
   metric-override kNN, full-scan fallback); `xFilter` calling `hnsw_search` with
-  per-function metric override; `xColumn` fetching vector BLOBs as `[x,y,z]`
-  text; `xUpdate` for INSERT (→ `hnsw_insert`), DELETE (→ `hnsw_delete`), and
-  UPDATE (delete + re-insert, rowid-change rejected with SQLITE_MISMATCH);
-  `xFindFunction` intercepting `vec_distance_l2`, `vec_distance_cosine`,
-  `vec_distance_ip`, `vec_distance_l1` on vtab columns to route them as
-  index-accelerated kNN (idxNum 151-154); `xShadowName`.
-- **Tests** (all 9 passing via `test/run_all.sh`): `basic.sql`, `vec_parse.sql`,
-  `distance.sql`, `shadow.sql`, `insert.sql`, `ffi_test.lua`, `shadow_connect`
-  (xConnect persistence), `knn.sql` (kNN ordering/DELETE/UPDATE),
-  `operators.sql` (vec_distance_* operator aliases via xFindFunction).
+  per-function metric override; full-scan (idxNum=0) reads all rowids from
+  `_data`; `xColumn` fetching vector BLOBs as `[x,y,z]` text; `xUpdate` for
+  INSERT (→ `hnsw_insert`), DELETE (→ `hnsw_delete`), and UPDATE (delete +
+  re-insert, rowid-change rejected with SQLITE_MISMATCH); `xFindFunction`
+  intercepting all six `vec_distance_*` functions on vtab columns to route them
+  as index-accelerated kNN (idxNum 151-156: l2, cosine, ip, l1, hamming,
+  jaccard); `xShadowName`.
+- **Tests** (all 10 passing via `test/run_all.sh`): `basic.sql`,
+  `vec_parse.sql`, `distance.sql`, `shadow.sql`, `insert.sql`, `ffi_test.lua`,
+  `shadow_connect` (xConnect persistence), `knn.sql` (kNN
+  ordering/DELETE/UPDATE), `operators.sql` (all 6 `vec_distance_*` operator
+  aliases via xFindFunction), `recall_bench.lua` (HNSW recall@k vs brute-force
+  ground truth).
 
-**Not yet built:** accuracy/recall benchmarks; approximate-kNN recall vs
-brute-force comparison; full-scan `xFilter` (idxNum=0 currently returns empty
-cursor rather than iterating all rows in insertion order).
+**Not yet built:** graph repair on delete (v1 leaves edges sparser); batch
+import / bulk-load optimisation; `ef_search` runtime override via SQL.
 
 ---
 
