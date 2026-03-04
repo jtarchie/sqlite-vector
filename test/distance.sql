@@ -39,9 +39,21 @@ INSERT INTO assert VALUES(ABS(vec_distance_l1('[1,2]', '[4,6]') - 7.0) < 1e-5);
 -- identical → 0
 INSERT INTO assert VALUES(vec_distance_l1('[5,5,5]', '[5,5,5]') = 0.0);
 
+-- ── vec_distance_hamming / vec_distance_jaccard ───────────────────────────
+-- identical vectors -> bit distance 0 for both metrics
+INSERT INTO assert VALUES(ABS(vec_distance_hamming('[1,2,3]', '[1,2,3]')) < 1e-5);
+INSERT INTO assert VALUES(ABS(vec_distance_jaccard('[1,2,3]', '[1,2,3]')) < 1e-5);
+
+-- different vectors should have positive bit distances
+INSERT INTO assert VALUES(vec_distance_hamming('[1,2,3]', '[3,2,1]') > 0.0);
+INSERT INTO assert VALUES(vec_distance_jaccard('[1,2,3]', '[3,2,1]') > 0.0);
+
 -- ── NULL passthrough ───────────────────────────────────────────────────────
 INSERT INTO assert VALUES(vec_distance_l2(NULL, '[1,2]') IS NULL);
 INSERT INTO assert VALUES(vec_distance_cosine('[1,0]', NULL) IS NULL);
 INSERT INTO assert VALUES(vec_distance_ip(NULL, NULL) IS NULL);
+INSERT INTO assert VALUES(vec_distance_l1(NULL, '[1,0]') IS NULL);
+INSERT INTO assert VALUES(vec_distance_hamming('[1,0]', NULL) IS NULL);
+INSERT INTO assert VALUES(vec_distance_jaccard(NULL, '[1,0]') IS NULL);
 
 SELECT 'distance tests passed';

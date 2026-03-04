@@ -8,45 +8,11 @@
 -- Usage:  luajit test/recall_bench.lua
 --         N=5000 DIMS=256 K=20 luajit test/recall_bench.lua
 local ffi = require "ffi"
+local sqlite = require "test.wrappers.lua_sqlite"
+local sq = sqlite.sq
 
--- ── SQLite C API declarations ───────────────────────────────────────────────
-ffi.cdef [[
-  typedef struct sqlite3      sqlite3;
-  typedef struct sqlite3_stmt sqlite3_stmt;
-
-  int    sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, const char *zVfs);
-  int    sqlite3_close(sqlite3 *db);
-  int    sqlite3_exec(sqlite3 *db, const char *sql, void *cb, void *arg, char **errmsg);
-  void   sqlite3_free(void *p);
-  int    sqlite3_enable_load_extension(sqlite3 *db, int onoff);
-  int    sqlite3_load_extension(sqlite3 *db, const char *file, const char *proc, char **errmsg);
-
-  int    sqlite3_prepare_v2(sqlite3 *db, const char *sql, int nBytes,
-                            sqlite3_stmt **ppStmt, const char **pzTail);
-  int    sqlite3_step(sqlite3_stmt *stmt);
-  int    sqlite3_finalize(sqlite3_stmt *stmt);
-  int    sqlite3_reset(sqlite3_stmt *stmt);
-  int    sqlite3_bind_text(sqlite3_stmt *stmt, int idx, const char *val, int n, void *dtor);
-
-  int         sqlite3_column_count(sqlite3_stmt *stmt);
-  int         sqlite3_column_type(sqlite3_stmt *stmt, int col);
-  double      sqlite3_column_double(sqlite3_stmt *stmt, int col);
-  int64_t     sqlite3_column_int64(sqlite3_stmt *stmt, int col);
-  const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int col);
-
-  const char *sqlite3_errmsg(sqlite3 *db);
-]]
-
-local SQLITE_OK = 0
-local SQLITE_ROW = 100
-local SQLITE_DONE = 101
-local SQLITE_OPEN_READWRITE = 0x00000002
-local SQLITE_OPEN_CREATE = 0x00000004
-local SQLITE_OPEN_MEMORY = 0x00000080
-local SQLITE_OPEN_URI = 0x00000040
-local SQLITE_TRANSIENT = ffi.cast("void*", -1)
-
-local sq = ffi.load("/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib")
+local SQLITE_DONE = sqlite.SQLITE_DONE
+local SQLITE_TRANSIENT = sqlite.SQLITE_TRANSIENT
 
 -- ── Configuration ───────────────────────────────────────────────────────────
 -- Override via environment variables: N=5000 luajit test/recall_bench.lua
@@ -64,40 +30,18 @@ local SEED = tonumber(os.getenv("SEED")) or 42
 
 -- ── Helpers ─────────────────────────────────────────────────────────────────
 
-local DYLIB = "build/macosx/arm64/release/libsqlite_vector.dylib"
-
 local function open_db()
-    local flags = SQLITE_OPEN_READWRITE + SQLITE_OPEN_CREATE + SQLITE_OPEN_MEMORY + SQLITE_OPEN_URI
-    local dbp = ffi.new("sqlite3*[1]")
-    local rc = sq.sqlite3_open_v2(":memory:", dbp, flags, nil)
-    assert(rc == SQLITE_OK, "sqlite3_open_v2 failed: " .. rc)
-    local db = dbp[0]
-    sq.sqlite3_enable_load_extension(db, 1)
-    local errmsg = ffi.new("char*[1]")
-    rc = sq.sqlite3_load_extension(db, DYLIB, nil, errmsg)
-    if rc ~= SQLITE_OK then
-        local msg = ffi.string(errmsg[0])
-        sq.sqlite3_free(errmsg[0])
-        error("load_extension failed: " .. msg)
-    end
-    return db
+    return sqlite.open_db({
+        memory = true
+    })
 end
 
 local function exec(db, sql)
-    local errmsg = ffi.new("char*[1]")
-    local rc = sq.sqlite3_exec(db, sql, nil, nil, errmsg)
-    if rc ~= SQLITE_OK then
-        local msg = ffi.string(errmsg[0])
-        sq.sqlite3_free(errmsg[0])
-        error("exec failed (" .. rc .. "): " .. msg .. "\nSQL: " .. sql)
-    end
+    sqlite.exec(db, sql)
 end
 
 local function prepare(db, sql)
-    local stmtp = ffi.new("sqlite3_stmt*[1]")
-    local rc = sq.sqlite3_prepare_v2(db, sql, -1, stmtp, nil)
-    assert(rc == SQLITE_OK, "prepare failed: " .. ffi.string(sq.sqlite3_errmsg(db)) .. "\nSQL: " .. sql)
-    return stmtp[0]
+    return sqlite.prepare(db, sql)
 end
 
 -- ── Vector generation ───────────────────────────────────────────────────────
@@ -106,11 +50,56 @@ math.randomseed(SEED)
 
 -- Generate a random float vector as "[f1,f2,...,fn]" text.
 local function random_vec(dims)
-    local t = {}
+    local vals = {}
+    local txt = {}
     for i = 1, dims do
-        t[i] = string.format("%.6f", math.random() * 2 - 1) -- [-1, 1]
+        local v = math.random() * 2 - 1
+        vals[i] = v
+        txt[i] = string.format("%.6f", v)
     end
-    return "[" .. table.concat(t, ",") .. "]"
+    return vals, "[" .. table.concat(txt, ",") .. "]"
+end
+
+local function metric_distance(metric, a, b)
+    if metric == "l2" then
+        local sum = 0.0
+        for i = 1, #a do
+            local d = a[i] - b[i]
+            sum = sum + d * d
+        end
+        return math.sqrt(sum)
+    elseif metric == "l1" then
+        local sum = 0.0
+        for i = 1, #a do
+            local d = a[i] - b[i]
+            if d < 0 then
+                d = -d
+            end
+            sum = sum + d
+        end
+        return sum
+    elseif metric == "ip" then
+        local dot = 0.0
+        for i = 1, #a do
+            dot = dot + a[i] * b[i]
+        end
+        return -dot
+    elseif metric == "cosine" then
+        local dot = 0.0
+        local na = 0.0
+        local nb = 0.0
+        for i = 1, #a do
+            dot = dot + a[i] * b[i]
+            na = na + a[i] * a[i]
+            nb = nb + b[i] * b[i]
+        end
+        if na == 0.0 or nb == 0.0 then
+            return 1.0
+        end
+        return 1.0 - (dot / (math.sqrt(na) * math.sqrt(nb)))
+    end
+
+    error("unsupported metric for Lua brute-force baseline: " .. tostring(metric))
 end
 
 -- ── Main ────────────────────────────────────────────────────────────────────
@@ -129,8 +118,11 @@ exec(db, string.format(
 io.write("generating vectors... ")
 io.flush()
 local vectors = {}
+local vectors_num = {}
 for i = 1, N do
-    vectors[i] = random_vec(DIMS)
+    local vals, txt = random_vec(DIMS)
+    vectors_num[i] = vals
+    vectors[i] = txt
 end
 io.write("done\n")
 
@@ -187,27 +179,34 @@ local t_hnsw = os.clock() - t1
 io.write(string.format("%.3fs (%.1f ms/query)\n", t_hnsw, t_hnsw / #query_indices * 1000))
 
 -- ── Brute-force phase ───────────────────────────────────────────────────────
--- Use vtab full-scan + vec_distance_* scalar for ground truth.
+-- Use pure Lua distance evaluation over all generated vectors as ground truth.
 io.write("brute-force queries... ")
 io.flush()
 local t2 = os.clock()
 
-local dist_fn_name = "vec_distance_" .. METRIC
-local bf_sql = string.format("SELECT rowid FROM bench ORDER BY %s(vector, ?) LIMIT %d", dist_fn_name, K)
-local bf_stmt = prepare(db, bf_sql)
-
 local bf_results = {} -- query_idx -> {rowid1, rowid2, ...}
 for _, qi in ipairs(query_indices) do
-    local qvec = vectors[qi]
-    sq.sqlite3_bind_text(bf_stmt, 1, qvec, #qvec, SQLITE_TRANSIENT)
-    local rowids = {}
-    while sq.sqlite3_step(bf_stmt) == SQLITE_ROW do
-        rowids[#rowids + 1] = tonumber(sq.sqlite3_column_int64(bf_stmt, 0))
+    local qnum = vectors_num[qi]
+    local scored = {}
+
+    for candidate = 1, N do
+        scored[#scored + 1] = {
+            rowid = candidate,
+            dist = metric_distance(METRIC, vectors_num[candidate], qnum)
+        }
     end
-    sq.sqlite3_reset(bf_stmt)
+
+    table.sort(scored, function(a, b)
+        return a.dist < b.dist
+    end)
+
+    local rowids = {}
+    for i = 1, math.min(K, #scored) do
+        rowids[#rowids + 1] = scored[i].rowid
+    end
+
     bf_results[qi] = rowids
 end
-sq.sqlite3_finalize(bf_stmt)
 
 local t_bf = os.clock() - t2
 io.write(string.format("%.3fs (%.1f ms/query)\n", t_bf, t_bf / #query_indices * 1000))

@@ -6,62 +6,18 @@
 -- Run from the workspace root:
 --   luajit test/ffi_test.lua
 local ffi = require "ffi"
+local sqlite = require "test.wrappers.lua_sqlite"
+local sq = sqlite.sq
 
--- ── SQLite C API declarations ───────────────────────────────────────────────
-ffi.cdef [[
-  typedef struct sqlite3      sqlite3;
-  typedef struct sqlite3_stmt sqlite3_stmt;
-
-  int    sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, const char *zVfs);
-  int    sqlite3_close(sqlite3 *db);
-  int    sqlite3_exec(sqlite3 *db, const char *sql, void *cb, void *arg, char **errmsg);
-  void   sqlite3_free(void *p);
-  int    sqlite3_enable_load_extension(sqlite3 *db, int onoff);
-  int    sqlite3_load_extension(sqlite3 *db, const char *file, const char *proc, char **errmsg);
-
-  int    sqlite3_prepare_v2(sqlite3 *db, const char *sql, int nBytes,
-                            sqlite3_stmt **ppStmt, const char **pzTail);
-  int    sqlite3_step(sqlite3_stmt *stmt);
-  int    sqlite3_finalize(sqlite3_stmt *stmt);
-  int    sqlite3_reset(sqlite3_stmt *stmt);
-
-  int         sqlite3_column_count(sqlite3_stmt *stmt);
-  int         sqlite3_column_type(sqlite3_stmt *stmt, int col);
-  const void *sqlite3_column_blob(sqlite3_stmt *stmt, int col);
-  int         sqlite3_column_bytes(sqlite3_stmt *stmt, int col);
-  double      sqlite3_column_double(sqlite3_stmt *stmt, int col);
-  int64_t     sqlite3_column_int64(sqlite3_stmt *stmt, int col);
-  const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int col);
-
-  int64_t     sqlite3_last_insert_rowid(sqlite3 *db);
-  const char *sqlite3_errmsg(sqlite3 *db);
-  int         sqlite3_errcode(sqlite3 *db);
-  int         sqlite3_extended_errcode(sqlite3 *db);
-]]
-
--- SQLite constants
-local SQLITE_OK = 0
-local SQLITE_ROW = 100
-local SQLITE_DONE = 101
-local SQLITE_OPEN_READWRITE = 0x00000002
-local SQLITE_OPEN_CREATE = 0x00000004
-local SQLITE_OPEN_MEMORY = 0x00000080
-local SQLITE_OPEN_URI = 0x00000040
--- Column types
-local SQLITE_INTEGER = 1
-local SQLITE_FLOAT = 2
-local SQLITE_TEXT = 3
-local SQLITE_BLOB = 4
-local SQLITE_NULL = 5
--- Error codes
-local SQLITE_ERROR = 1
-local SQLITE_CONSTRAINT = 19
-
-local sq = ffi.load("/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib")
-
--- ── Helpers ─────────────────────────────────────────────────────────────────
-
-local DYLIB = "build/macosx/arm64/release/libsqlite_vector.dylib"
+local SQLITE_OK = sqlite.SQLITE_OK
+local SQLITE_ERROR = sqlite.SQLITE_ERROR
+local SQLITE_DONE = sqlite.SQLITE_DONE
+local SQLITE_INTEGER = sqlite.SQLITE_INTEGER
+local SQLITE_FLOAT = sqlite.SQLITE_FLOAT
+local SQLITE_TEXT = sqlite.SQLITE_TEXT
+local SQLITE_BLOB = sqlite.SQLITE_BLOB
+local SQLITE_NULL = sqlite.SQLITE_NULL
+local SQLITE_CONSTRAINT = sqlite.SQLITE_CONSTRAINT
 
 local pass, fail = 0, 0
 local function check(cond, msg)
@@ -76,47 +32,22 @@ end
 
 -- Open an in-memory SQLite database with the extension loaded.
 local function open_db()
-    local flags = SQLITE_OPEN_READWRITE + SQLITE_OPEN_CREATE + SQLITE_OPEN_MEMORY + SQLITE_OPEN_URI
-    local dbp = ffi.new("sqlite3*[1]")
-    local rc = sq.sqlite3_open_v2(":memory:", dbp, flags, nil)
-    assert(rc == SQLITE_OK, "sqlite3_open_v2 failed: " .. rc)
-    local db = dbp[0]
-    sq.sqlite3_enable_load_extension(db, 1)
-    local errmsg = ffi.new("char*[1]")
-    rc = sq.sqlite3_load_extension(db, DYLIB, nil, errmsg)
-    if rc ~= SQLITE_OK then
-        local msg = ffi.string(errmsg[0])
-        sq.sqlite3_free(errmsg[0])
-        error("load_extension failed: " .. msg)
-    end
-    return db
+    return sqlite.open_db({
+        memory = true
+    })
 end
 
 local function close_db(db)
-    sq.sqlite3_close(db)
+    sqlite.close_db(db)
 end
 
 local function exec(db, sql)
-    local errmsg = ffi.new("char*[1]")
-    local rc = sq.sqlite3_exec(db, sql, nil, nil, errmsg)
-    if rc ~= SQLITE_OK then
-        local msg = ffi.string(errmsg[0])
-        sq.sqlite3_free(errmsg[0])
-        error("exec failed (" .. rc .. "): " .. msg .. "\nSQL: " .. sql)
-    end
-    return rc
+    return sqlite.exec(db, sql)
 end
 
 -- Prepare and step a SELECT, return callback with (stmt) for each row.
 local function query(db, sql, fn)
-    local stmtp = ffi.new("sqlite3_stmt*[1]")
-    local rc = sq.sqlite3_prepare_v2(db, sql, -1, stmtp, nil)
-    assert(rc == SQLITE_OK, "prepare failed: " .. ffi.string(sq.sqlite3_errmsg(db)))
-    local stmt = stmtp[0]
-    while sq.sqlite3_step(stmt) == SQLITE_ROW do
-        fn(stmt)
-    end
-    sq.sqlite3_finalize(stmt)
+    sqlite.query(db, sql, fn)
 end
 
 -- ── Test suites ──────────────────────────────────────────────────────────────
@@ -296,6 +227,32 @@ do
     rc = sq.sqlite3_prepare_v2(db, "SELECT vector FROM v", -1, stmtp, nil)
     check(rc == SQLITE_OK, "full-scan SELECT prepares successfully")
     sq.sqlite3_finalize(stmtp[0])
+
+    close_db(db)
+end
+
+print(
+    "── FFI: scalar error paths ───────────────────────────────────────────────")
+do
+    local db = open_db()
+    local stmtp = ffi.new("sqlite3_stmt*[1]")
+
+    -- malformed vector literal should surface SQLITE_ERROR
+    sq.sqlite3_prepare_v2(db, "SELECT vec('[1,2')", -1, stmtp, nil)
+    local rc = sq.sqlite3_step(stmtp[0])
+    sq.sqlite3_finalize(stmtp[0])
+    check(rc == SQLITE_ERROR, "vec() malformed literal returns SQLITE_ERROR")
+    local msg = ffi.string(sq.sqlite3_errmsg(db))
+    check(msg:find("invalid") ~= nil or msg:find("vector") ~= nil,
+        "vec() malformed literal sets helpful error message: " .. msg)
+
+    -- distance mismatch should also be a SQL error
+    sq.sqlite3_prepare_v2(db, "SELECT vec_distance_l2('[1,2,3]', '[1,2]')", -1, stmtp, nil)
+    rc = sq.sqlite3_step(stmtp[0])
+    sq.sqlite3_finalize(stmtp[0])
+    check(rc == SQLITE_ERROR, "vec_distance_l2 dimension mismatch returns SQLITE_ERROR")
+    msg = ffi.string(sq.sqlite3_errmsg(db))
+    check(msg:find("dimension mismatch") ~= nil, "distance mismatch error message mentions dimensions: " .. msg)
 
     close_db(db)
 end
