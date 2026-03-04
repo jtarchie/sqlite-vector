@@ -37,6 +37,8 @@ run "knn"            sqlite3 :memory: < test/knn.sql
 run "operators"      sqlite3 :memory: < test/operators.sql
 run "bulk_insert"    sqlite3 :memory: < test/bulk_insert.sql
 run "delete_repair"  sqlite3 :memory: < test/delete_repair.sql
+run "atomic_update"  sqlite3 :memory: < test/atomic_update.sql
+run "persist"        luajit test/persist_test.lua
 run "recall"         luajit test/recall_bench.lua
 
 echo "==> All tests passed."

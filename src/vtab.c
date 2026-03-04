@@ -45,6 +45,17 @@ struct Vec0Table {
                                  node_id=? */
   sqlite3_stmt *sc_rev_nbrs;  /* SELECT DISTINCT node_id FROM _graph WHERE
                                  layer=? AND neighbor_id=? */
+
+  /* ── Transaction state ─────────────────────────────────────────────────
+   * Set by xBegin/cleared by xCommit or xRollback.  While in_txn==1,
+   * config writes (count, entry_point, max_layer) are deferred: shadow-table
+   * rows are written by SQLite's own transaction machinery, but the _config
+   * UPDATE is suppressed until xCommit so that a ROLLBACK leaves _config
+   * consistent with the rolled-back shadow tables. */
+  int in_txn;                      /* non-zero inside a vtab transaction */
+  sqlite3_int64 saved_count;       /* count at BEGIN time */
+  sqlite3_int64 saved_entry_point; /* entry_point at BEGIN time */
+  int saved_max_layer;             /* max_layer at BEGIN time */
 };
 
 typedef struct Vec0Cursor Vec0Cursor;
@@ -151,6 +162,8 @@ static void vec0_make_hctx(Vec0Table *p, HnswCtx *out) {
   out->sc_ins_layer = p->sc_ins_layer;
   out->sc_nbr_count = p->sc_nbr_count;
   out->sc_rev_nbrs = p->sc_rev_nbrs;
+  /* Suppress _config DB writes inside a vtab transaction; xCommit flushes. */
+  out->defer_config = p->in_txn;
 }
 
 /* ── Shadow table helpers ─────────────────────────────────────────────────
@@ -811,6 +824,12 @@ static int vec0Rowid(sqlite3_vtab_cursor *pCursor, sqlite_int64 *pRowid) {
  * → auto-assign) argv[2]  col 0 value      (hidden table-name col — ignore)
  *   argv[3]  col 1 value      (vector TEXT — the payload)
  *   argv[4]  col 2 value      (distance REAL HIDDEN — ignore on INSERT)
+ *
+ * Shadow-table atomicity: SQLite automatically creates a statement-level
+ * savepoint before calling xUpdate.  If xUpdate returns an error, SQLite
+ * rolls back all shadow-table writes made during this callback.  We only
+ * need to restore the in-memory Vec0Table fields (count, entry_point,
+ * max_layer) on error paths.
  */
 
 static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
@@ -827,20 +846,28 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     sqlite3_exec(p->db, dsql, NULL, NULL, NULL);
     sqlite3_free(dsql);
 
-    /* Remove from HNSW graph */
+    /* Remove from HNSW graph — check return code (was previously ignored). */
     HnswCtx hctx;
     vec0_make_hctx(p, &hctx);
-    hnsw_delete(&hctx, del_rowid);
+    int drc = hnsw_delete(&hctx, del_rowid);
+    if (drc != SQLITE_OK) {
+      /* SQLite auto-rollback undoes the _data DELETE and any graph writes.
+       * In-memory state is still unchanged (p fields not yet modified). */
+      pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+      return drc;
+    }
     p->entry_point = hctx.entry_point;
     p->max_layer = hctx.max_layer;
 
     if (p->count > 0)
       p->count--;
-    char *csql = sqlite3_mprintf(
-        "UPDATE \"%w\".\"%w_config\" SET value='%lld' WHERE key='count'",
-        p->schema, p->name, p->count);
-    sqlite3_exec(p->db, csql, NULL, NULL, NULL);
-    sqlite3_free(csql);
+    if (!p->in_txn) {
+      char *csql = sqlite3_mprintf(
+          "UPDATE \"%w\".\"%w_config\" SET value='%lld' WHERE key='count'",
+          p->schema, p->name, p->count);
+      sqlite3_exec(p->db, csql, NULL, NULL, NULL);
+      sqlite3_free(csql);
+    }
     return SQLITE_OK;
   }
 
@@ -873,6 +900,11 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
       return SQLITE_CONSTRAINT;
     }
 
+    /* Save pre-state so we can restore in-memory fields on error. */
+    sqlite3_int64 pre_count = p->count;
+    sqlite3_int64 pre_ep = p->entry_point;
+    int pre_ml = p->max_layer;
+
     /* Delete old row from _data and HNSW graph */
     char *dsql = sqlite3_mprintf("DELETE FROM \"%w\".\"%w_data\" WHERE id=%lld",
                                  p->schema, p->name, old_rowid);
@@ -881,7 +913,16 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
     HnswCtx del_ctx;
     vec0_make_hctx(p, &del_ctx);
-    hnsw_delete(&del_ctx, old_rowid);
+    upd_rc = hnsw_delete(&del_ctx, old_rowid);
+    if (upd_rc != SQLITE_OK) {
+      /* SQLite auto-rollback undoes shadow writes; restore in-memory state. */
+      p->count = pre_count;
+      p->entry_point = pre_ep;
+      p->max_layer = pre_ml;
+      sqlite3_free(upd_vec);
+      pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+      return upd_rc;
+    }
     p->entry_point = del_ctx.entry_point;
     p->max_layer = del_ctx.max_layer;
     if (p->count > 0)
@@ -895,6 +936,9 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     upd_rc = sqlite3_prepare_v2(p->db, ins_sql, -1, &ins_stmt, NULL);
     sqlite3_free(ins_sql);
     if (upd_rc != SQLITE_OK) {
+      p->count = pre_count;
+      p->entry_point = pre_ep;
+      p->max_layer = pre_ml;
       sqlite3_free(upd_vec);
       pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
       return upd_rc;
@@ -904,20 +948,15 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     upd_rc = sqlite3_step(ins_stmt);
     sqlite3_finalize(ins_stmt);
     if (upd_rc != SQLITE_DONE) {
+      p->count = pre_count;
+      p->entry_point = pre_ep;
+      p->max_layer = pre_ml;
       sqlite3_free(upd_vec);
       pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
       return SQLITE_ERROR;
     }
     p->count++;
     *pRowid = old_rowid;
-
-    /* Sync count */
-    char *cnt_sql =
-        sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%lld'"
-                        " WHERE key='count'",
-                        p->schema, p->name, p->count);
-    sqlite3_exec(p->db, cnt_sql, NULL, NULL, NULL);
-    sqlite3_free(cnt_sql);
 
     /* Re-insert into HNSW graph */
     HnswCtx ins_ctx;
@@ -927,9 +966,26 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     ins_ctx.max_layer = p->max_layer;
     upd_rc = hnsw_insert(&ins_ctx, old_rowid, upd_vec);
     sqlite3_free(upd_vec);
+    if (upd_rc != SQLITE_OK) {
+      /* count: net of delete+insert is still pre_count */
+      p->count = pre_count;
+      p->entry_point = pre_ep;
+      p->max_layer = pre_ml;
+      pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+      return upd_rc;
+    }
     p->entry_point = ins_ctx.entry_point;
     p->max_layer = ins_ctx.max_layer;
-    return upd_rc;
+    /* count is unchanged net (delete+reinsert); write config if not deferred */
+    if (!p->in_txn) {
+      char *cnt_sql =
+          sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%lld'"
+                          " WHERE key='count'",
+                          p->schema, p->name, p->count);
+      sqlite3_exec(p->db, cnt_sql, NULL, NULL, NULL);
+      sqlite3_free(cnt_sql);
+    }
+    return SQLITE_OK;
   }
 
   /* INSERT: argv[1] is NULL (auto-assign rowid) or an explicit integer. */
@@ -956,7 +1012,10 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     return SQLITE_CONSTRAINT;
   }
 
-  /* Insert raw float BLOB into _data */
+  /* Insert raw float BLOB into _data.
+   * SQLite's automatic statement savepoint ensures that if hnsw_insert later
+   * fails and we return an error, the _data row and any partial graph writes
+   * are rolled back automatically by SQLite. */
   char *sql = sqlite3_mprintf(
       "INSERT INTO \"%w\".\"%w_data\" (vector) VALUES (?)", p->schema, p->name);
   sqlite3_stmt *stmt = NULL;
@@ -980,21 +1039,30 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
   *pRowid = sqlite3_last_insert_rowid(p->db);
   p->count++;
 
-  /* Keep count in _config in sync */
-  sql = sqlite3_mprintf(
-      "UPDATE \"%w\".\"%w_config\" SET value = '%lld' WHERE key = 'count'",
-      p->schema, p->name, p->count);
-  sqlite3_exec(p->db, sql, NULL, NULL, NULL);
-  sqlite3_free(sql);
-
   /* Insert into HNSW graph */
   HnswCtx hctx;
   vec0_make_hctx(p, &hctx);
   rc = hnsw_insert(&hctx, *pRowid, vec);
   sqlite3_free(vec);
+  if (rc != SQLITE_OK) {
+    /* SQLite auto-rollback undoes the _data insert and any partial graph
+     * writes.  Undo the in-memory count increment. */
+    p->count--;
+    pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+    return rc;
+  }
   p->entry_point = hctx.entry_point;
   p->max_layer = hctx.max_layer;
-  return rc;
+
+  /* Keep count in _config in sync (deferred to xCommit when in_txn) */
+  if (!p->in_txn) {
+    sql = sqlite3_mprintf(
+        "UPDATE \"%w\".\"%w_config\" SET value = '%lld' WHERE key = 'count'",
+        p->schema, p->name, p->count);
+    sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+  }
+  return SQLITE_OK;
 }
 
 /* ── xFindFunction ───────────────────────────────────────────────────────────
@@ -1063,6 +1131,58 @@ static int vec0ShadowName(const char *zName) {
   return 0;
 }
 
+/* ── xBegin / xCommit / xRollback ────────────────────────────────────────────
+ *
+ * xBegin: snapshot in-memory config state so xRollback can restore it.
+ * xCommit: flush the (possibly updated) in-memory count/entry_point/max_layer
+ *          to _config in a single shot.  During the transaction these were
+ *          suppressed (defer_config=1) so they were not written row-by-row.
+ * xRollback: the shadow-table writes were rolled back by SQLite automatically;
+ *            restore in-memory state to match.
+ */
+static int vec0Begin(sqlite3_vtab *pVtab) {
+  Vec0Table *p = (Vec0Table *)pVtab;
+  p->in_txn = 1;
+  p->saved_count = p->count;
+  p->saved_entry_point = p->entry_point;
+  p->saved_max_layer = p->max_layer;
+  return SQLITE_OK;
+}
+
+static int vec0Commit(sqlite3_vtab *pVtab) {
+  Vec0Table *p = (Vec0Table *)pVtab;
+  char *sql;
+  /* Write all three mutable config values in one go. */
+  sql = sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%lld'"
+                        " WHERE key='count'",
+                        p->schema, p->name, p->count);
+  sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+  sql = sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%lld'"
+                        " WHERE key='entry_point'",
+                        p->schema, p->name, p->entry_point);
+  sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+  sql = sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%d'"
+                        " WHERE key='max_layer'",
+                        p->schema, p->name, p->max_layer);
+  sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+  p->in_txn = 0;
+  return SQLITE_OK;
+}
+
+static int vec0Rollback(sqlite3_vtab *pVtab) {
+  Vec0Table *p = (Vec0Table *)pVtab;
+  /* Shadow-table writes were already rolled back by SQLite.
+   * Restore in-memory state to match. */
+  p->count = p->saved_count;
+  p->entry_point = p->saved_entry_point;
+  p->max_layer = p->saved_max_layer;
+  p->in_txn = 0;
+  return SQLITE_OK;
+}
+
 /* ── Module definition ───────────────────────────────────────────────────────
  */
 
@@ -1081,10 +1201,10 @@ sqlite3_module vec0Module = {
     /* xColumn     */ vec0Column,
     /* xRowid      */ vec0Rowid,
     /* xUpdate     */ vec0Update,
-    /* xBegin      */ NULL,
+    /* xBegin      */ vec0Begin,
     /* xSync       */ NULL,
-    /* xCommit     */ NULL,
-    /* xRollback   */ NULL,
+    /* xCommit     */ vec0Commit,
+    /* xRollback   */ vec0Rollback,
     /* xFindFunction */ vec0FindFunction,
     /* xRename     */ NULL,
     /* xSavepoint  */ NULL,

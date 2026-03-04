@@ -243,8 +243,12 @@ static int fetch_vector_stmt(sqlite3_stmt *stmt_get_vec, sqlite3_int64 id,
   return SQLITE_OK;
 }
 
-/* Persist a single integer config value. */
+/* Persist a single integer config value.
+ * When ctx->defer_config is set the in-memory fields have already been updated
+ * by the caller; the DB write is suppressed and will happen in xCommit. */
 static int update_config(HnswCtx *ctx, const char *key, sqlite3_int64 val) {
+  if (ctx->defer_config)
+    return SQLITE_OK;
   char *sql = sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%lld' "
                               "WHERE key='%q'",
                               ctx->schema, ctx->tbl_name, val, key);

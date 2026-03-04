@@ -24,6 +24,9 @@ typedef struct HnswCtx {
   int max_layer;             /* current top layer */
   dist_fn_t dist_fn;         /* distance kernel (set from metric string) */
 
+  /* If non-zero, update_config() skips DB writes (deferred to xCommit). */
+  int defer_config;
+
   /*
    * Optional pre-prepared (borrowed) statements — populated by vtab.c from
    * the Vec0Table statement cache.  If non-NULL, hnsw_* functions use them
