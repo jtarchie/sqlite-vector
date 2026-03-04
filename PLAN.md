@@ -42,22 +42,22 @@ SELECT rowid, distance FROM items WHERE items MATCH vec('[0.1, ...]') LIMIT 10;
   graph repair).
 - **`src/vtab.{h,c}`** — Complete `sqlite3_module` (iVersion=3):
   `xCreate`/`xConnect`/`xDisconnect`/`xDestroy` (4 shadow tables + config
-  persistence); `xBestIndex` (MATCH → kNN, rowid-eq → point lookup, op 151-154
-  → metric-override kNN, full-scan fallback); `xFilter` calling `hnsw_search`
-  with per-function metric override; `xColumn` fetching vector BLOBs as
-  `[x,y,z]` text; `xUpdate` for INSERT (→ `hnsw_insert`), DELETE (→
-  `hnsw_delete`), and UPDATE (delete + re-insert, rowid-change rejected with
-  SQLITE_MISMATCH); `xFindFunction` intercepting `vec_distance_l2`,
-  `vec_distance_cosine`, `vec_distance_ip`, `vec_distance_l1` on vtab columns
-  to route them as index-accelerated kNN (idxNum 151-154); `xShadowName`.
+  persistence); `xBestIndex` (MATCH → kNN, rowid-eq → point lookup, op 151-154 →
+  metric-override kNN, full-scan fallback); `xFilter` calling `hnsw_search` with
+  per-function metric override; `xColumn` fetching vector BLOBs as `[x,y,z]`
+  text; `xUpdate` for INSERT (→ `hnsw_insert`), DELETE (→ `hnsw_delete`), and
+  UPDATE (delete + re-insert, rowid-change rejected with SQLITE_MISMATCH);
+  `xFindFunction` intercepting `vec_distance_l2`, `vec_distance_cosine`,
+  `vec_distance_ip`, `vec_distance_l1` on vtab columns to route them as
+  index-accelerated kNN (idxNum 151-154); `xShadowName`.
 - **Tests** (all 9 passing via `test/run_all.sh`): `basic.sql`, `vec_parse.sql`,
   `distance.sql`, `shadow.sql`, `insert.sql`, `ffi_test.lua`, `shadow_connect`
-  (xConnect persistence), `knn.sql` (kNN ordering/DELETE/UPDATE), `operators.sql`
-  (vec_distance_* operator aliases via xFindFunction).
+  (xConnect persistence), `knn.sql` (kNN ordering/DELETE/UPDATE),
+  `operators.sql` (vec_distance_* operator aliases via xFindFunction).
 
-**Not yet built:** accuracy/recall benchmarks; approximate-kNN recall vs brute-force
-comparison; full-scan `xFilter` (idxNum=0 currently returns empty cursor rather than
-iterating all rows in insertion order).
+**Not yet built:** accuracy/recall benchmarks; approximate-kNN recall vs
+brute-force comparison; full-scan `xFilter` (idxNum=0 currently returns empty
+cursor rather than iterating all rows in insertion order).
 
 ---
 

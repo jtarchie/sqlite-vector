@@ -371,7 +371,8 @@ static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     if (op >= 151 && op <= 156) {
       pInfo->aConstraintUsage[i].argvIndex = 1;
       pInfo->aConstraintUsage[i].omit = 1;
-      pInfo->idxNum = op; /* 151=l2 152=cosine 153=ip 154=l1 155=hamming 156=jaccard */
+      pInfo->idxNum =
+          op; /* 151=l2 152=cosine 153=ip 154=l1 155=hamming 156=jaccard */
       pInfo->estimatedCost = 10.0;
       pInfo->estimatedRows = 10;
       return SQLITE_OK;
@@ -558,7 +559,8 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   /* Resolve distance function: operator alias overrides table metric */
   dist_fn_t knn_dist_fn = p->dist_fn;
   if (idxNum >= 151 && idxNum <= 156) {
-    static const char *op_metrics[] = {"l2", "cosine", "ip", "l1", "hamming", "jaccard"};
+    static const char *op_metrics[] = {"l2", "cosine",  "ip",
+                                       "l1", "hamming", "jaccard"};
     dist_fn_t override = distance_for_metric(op_metrics[idxNum - 151]);
     if (override)
       knn_dist_fn = override;
@@ -751,7 +753,8 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     char *upd_err = NULL;
     int upd_rc = vec_parse(upd_text, &upd_vec, &upd_dims, &upd_err);
     if (upd_rc != SQLITE_OK) {
-      pVtab->zErrMsg = upd_err ? upd_err : sqlite3_mprintf("vec0: invalid vector");
+      pVtab->zErrMsg =
+          upd_err ? upd_err : sqlite3_mprintf("vec0: invalid vector");
       return SQLITE_ERROR;
     }
     if (upd_dims != p->dims) {
@@ -762,9 +765,8 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     }
 
     /* Delete old row from _data and HNSW graph */
-    char *dsql =
-        sqlite3_mprintf("DELETE FROM \"%w\".\"%w_data\" WHERE id=%lld",
-                        p->schema, p->name, old_rowid);
+    char *dsql = sqlite3_mprintf("DELETE FROM \"%w\".\"%w_data\" WHERE id=%lld",
+                                 p->schema, p->name, old_rowid);
     sqlite3_exec(p->db, dsql, NULL, NULL, NULL);
     sqlite3_free(dsql);
 
@@ -786,9 +788,9 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
       p->count--;
 
     /* Re-insert with same rowid */
-    char *ins_sql =
-        sqlite3_mprintf("INSERT INTO \"%w\".\"%w_data\" (id, vector) VALUES (%lld, ?)",
-                        p->schema, p->name, old_rowid);
+    char *ins_sql = sqlite3_mprintf(
+        "INSERT INTO \"%w\".\"%w_data\" (id, vector) VALUES (%lld, ?)",
+        p->schema, p->name, old_rowid);
     sqlite3_stmt *ins_stmt = NULL;
     upd_rc = sqlite3_prepare_v2(p->db, ins_sql, -1, &ins_stmt, NULL);
     sqlite3_free(ins_sql);
@@ -797,8 +799,8 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
       pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
       return upd_rc;
     }
-    sqlite3_bind_blob(ins_stmt, 1, upd_vec,
-                      upd_dims * (int)sizeof(float), SQLITE_STATIC);
+    sqlite3_bind_blob(ins_stmt, 1, upd_vec, upd_dims * (int)sizeof(float),
+                      SQLITE_STATIC);
     upd_rc = sqlite3_step(ins_stmt);
     sqlite3_finalize(ins_stmt);
     if (upd_rc != SQLITE_DONE) {
@@ -925,9 +927,9 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
  * distance.c handle the call normally — xFindFunction is never invoked.
  */
 static int vec0FindFunction(sqlite3_vtab *pVtab, int nArg, const char *zName,
-                             void (**pxFunc)(sqlite3_context *, int,
+                            void (**pxFunc)(sqlite3_context *, int,
                                             sqlite3_value **),
-                             void **ppArg) {
+                            void **ppArg) {
   (void)pVtab;
   if (nArg != 2)
     return 0;
