@@ -21,6 +21,9 @@ struct Vec0Table {
   int m;        /* HNSW M parameter */
   int ef_construction;
   int ef_search;
+  sqlite3_int64 entry_point; /* Rowid of the current HNSW entry-point node */
+  int max_layer;             /* Maximum layer in the HNSW graph */
+  sqlite3_int64 count;       /* Number of vectors stored */
 };
 
 typedef struct Vec0Cursor Vec0Cursor;
@@ -54,13 +57,144 @@ static void vec0_free(Vec0Table *p) {
   sqlite3_free(p);
 }
 
+/* ── Shadow table helpers ─────────────────────────────────────────────────
+ */
+
+/* Declare the virtual table schema.  Must be called from both xCreate and
+ * xConnect before returning. */
+static int vec0_declare(sqlite3 *db, const char *name, char **pzErr) {
+  char *schema = sqlite3_mprintf(
+      "CREATE TABLE x(\"%w\" HIDDEN, vector TEXT, distance REAL HIDDEN)", name);
+  if (!schema)
+    return SQLITE_NOMEM;
+  int rc = sqlite3_declare_vtab(db, schema);
+  sqlite3_free(schema);
+  if (rc != SQLITE_OK)
+    *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(db));
+  return rc;
+}
+
+/* Create the four shadow tables and persist config.  Called only from
+ * xCreate (first-time table creation, not database re-open). */
+static int vec0_create_shadow(Vec0Table *p, char **pzErr) {
+  const char *n = p->name;
+  const char *s = p->schema;
+  int rc;
+  char *sql;
+
+  /* _config */
+  sql = sqlite3_mprintf("CREATE TABLE \"%w\".\"%w_config\" ("
+                        "  key TEXT PRIMARY KEY, "
+                        "  value TEXT"
+                        ") WITHOUT ROWID",
+                        s, n);
+  rc = sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+  if (rc != SQLITE_OK) {
+    *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+    return rc;
+  }
+
+  /* _data */
+  sql = sqlite3_mprintf("CREATE TABLE \"%w\".\"%w_data\" ("
+                        "  id     INTEGER PRIMARY KEY, "
+                        "  vector BLOB NOT NULL"
+                        ")",
+                        s, n);
+  rc = sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+  if (rc != SQLITE_OK) {
+    *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+    return rc;
+  }
+
+  /* _graph */
+  sql = sqlite3_mprintf("CREATE TABLE \"%w\".\"%w_graph\" ("
+                        "  layer       INTEGER NOT NULL, "
+                        "  node_id     INTEGER NOT NULL, "
+                        "  neighbor_id INTEGER NOT NULL, "
+                        "  distance    REAL    NOT NULL, "
+                        "  PRIMARY KEY (layer, node_id, neighbor_id)"
+                        ") WITHOUT ROWID",
+                        s, n);
+  rc = sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+  if (rc != SQLITE_OK) {
+    *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+    return rc;
+  }
+
+  /* _layers */
+  sql = sqlite3_mprintf("CREATE TABLE \"%w\".\"%w_layers\" ("
+                        "  node_id   INTEGER PRIMARY KEY, "
+                        "  max_layer INTEGER NOT NULL"
+                        ") WITHOUT ROWID",
+                        s, n);
+  rc = sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+  if (rc != SQLITE_OK) {
+    *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+    return rc;
+  }
+
+  /* Write config */
+  sql = sqlite3_mprintf("INSERT INTO \"%w\".\"%w_config\" (key, value) VALUES "
+                        "('dims','%d'),('metric','%q'),('m','%d'),"
+                        "('ef_construction','%d'),('ef_search','%d'),"
+                        "('entry_point','-1'),('max_layer','0'),('count','0')",
+                        s, n, p->dims, p->metric, p->m, p->ef_construction,
+                        p->ef_search);
+  rc = sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+  if (rc != SQLITE_OK)
+    *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+  return rc;
+}
+
+/* Read config from _config shadow table into p.  Called from xConnect. */
+static int vec0_read_config(Vec0Table *p, char **pzErr) {
+  char *sql = sqlite3_mprintf("SELECT key, value FROM \"%w\".\"%w_config\"",
+                              p->schema, p->name);
+  sqlite3_stmt *stmt = NULL;
+  int rc = sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL);
+  sqlite3_free(sql);
+  if (rc != SQLITE_OK) {
+    *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+    return rc;
+  }
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *key = (const char *)sqlite3_column_text(stmt, 0);
+    const char *val = (const char *)sqlite3_column_text(stmt, 1);
+    if (!key || !val)
+      continue;
+    if (strcmp(key, "dims") == 0)
+      p->dims = atoi(val);
+    else if (strcmp(key, "metric") == 0) {
+      sqlite3_free(p->metric);
+      p->metric = sqlite3_mprintf("%s", val);
+    } else if (strcmp(key, "m") == 0)
+      p->m = atoi(val);
+    else if (strcmp(key, "ef_construction") == 0)
+      p->ef_construction = atoi(val);
+    else if (strcmp(key, "ef_search") == 0)
+      p->ef_search = atoi(val);
+    else if (strcmp(key, "entry_point") == 0)
+      p->entry_point = (sqlite3_int64)atoll(val);
+    else if (strcmp(key, "max_layer") == 0)
+      p->max_layer = atoi(val);
+    else if (strcmp(key, "count") == 0)
+      p->count = (sqlite3_int64)atoll(val);
+  }
+  sqlite3_finalize(stmt);
+  return SQLITE_OK;
+}
+
 /* ── xCreate / xConnect ──────────────────────────────────────────────────────
  */
 
 static int vec0Init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                     sqlite3_vtab **ppVtab, char **pzErr, int isCreate) {
   (void)pAux;
-  (void)isCreate;
 
   Vec0Table *p = sqlite3_malloc(sizeof(*p));
   if (!p)
@@ -72,57 +206,60 @@ static int vec0Init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
   p->name = sqlite3_mprintf("%s", argc >= 3 ? argv[2] : "vec0");
 
   /* Defaults */
-  p->dims = 0;
-  p->metric = sqlite3_mprintf("l2");
+  p->metric = sqlite3_mprintf("cosine");
   p->m = 16;
-  p->ef_construction = 128;
-  p->ef_search = 64;
+  p->ef_construction = 200;
+  p->ef_search = 10;
+  p->entry_point = -1;
 
-  /* Parse options from argv[3..] */
-  for (int i = 3; i < argc; i++) {
-    char *val = NULL;
-    if (parse_arg(argv[i], "dims", &val)) {
-      p->dims = atoi(val);
-      sqlite3_free(val);
-    } else if (parse_arg(argv[i], "metric", &val)) {
-      sqlite3_free(p->metric);
-      p->metric = val;
-    } else if (parse_arg(argv[i], "m", &val)) {
-      p->m = atoi(val);
-      sqlite3_free(val);
-    } else if (parse_arg(argv[i], "ef_construction", &val)) {
-      p->ef_construction = atoi(val);
-      sqlite3_free(val);
-    } else if (parse_arg(argv[i], "ef_search", &val)) {
-      p->ef_search = atoi(val);
-      sqlite3_free(val);
+  if (isCreate) {
+    /* Parse options from argv[3..] */
+    for (int i = 3; i < argc; i++) {
+      char *val = NULL;
+      if (parse_arg(argv[i], "dims", &val)) {
+        p->dims = atoi(val);
+        sqlite3_free(val);
+      } else if (parse_arg(argv[i], "metric", &val)) {
+        sqlite3_free(p->metric);
+        p->metric = val;
+      } else if (parse_arg(argv[i], "m", &val)) {
+        p->m = atoi(val);
+        sqlite3_free(val);
+      } else if (parse_arg(argv[i], "ef_construction", &val)) {
+        p->ef_construction = atoi(val);
+        sqlite3_free(val);
+      } else if (parse_arg(argv[i], "ef_search", &val)) {
+        p->ef_search = atoi(val);
+        sqlite3_free(val);
+      }
+    }
+
+    if (p->dims <= 0) {
+      *pzErr = sqlite3_mprintf("vec0: dims=N is required and must be > 0");
+      vec0_free(p);
+      return SQLITE_ERROR;
+    }
+
+    int rc = vec0_create_shadow(p, pzErr);
+    if (rc != SQLITE_OK) {
+      vec0_free(p);
+      return rc;
+    }
+  } else {
+    /* xConnect: read config persisted in shadow table */
+    int rc = vec0_read_config(p, pzErr);
+    if (rc != SQLITE_OK) {
+      vec0_free(p);
+      return rc;
     }
   }
 
-  if (p->dims <= 0) {
-    *pzErr = sqlite3_mprintf("vec0: dims=N is required and must be > 0");
-    vec0_free(p);
-    return SQLITE_ERROR;
-  }
-
-  /* Declare a hidden column named after the table (required for MATCH syntax:
-   * WHERE vecs MATCH query — SQLite resolves 'vecs' as a column name).
-   * This mirrors how FTS5 exposes the table name as a hidden column at index 0.
-   * Col 0: <tablename> HIDDEN  — the kNN query vector
-   * Col 1: vector TEXT         — user-facing stored vector
-   * Col 2: distance REAL HIDDEN — result distance */
-  char *schema = sqlite3_mprintf(
-      "CREATE TABLE x(\"%w\" HIDDEN, vector TEXT, distance REAL HIDDEN)",
-      p->name);
-  if (!schema) {
-    vec0_free(p);
-    return SQLITE_NOMEM;
-  }
-  int rc = sqlite3_declare_vtab(db, schema);
-  sqlite3_free(schema);
-  if (rc != SQLITE_OK) {
-    vec0_free(p);
-    return rc;
+  {
+    int rc = vec0_declare(db, p->name, pzErr);
+    if (rc != SQLITE_OK) {
+      vec0_free(p);
+      return rc;
+    }
   }
 
   *ppVtab = (sqlite3_vtab *)p;
@@ -150,7 +287,15 @@ static int vec0Disconnect(sqlite3_vtab *pVtab) {
 }
 
 static int vec0Destroy(sqlite3_vtab *pVtab) {
-  vec0_free((Vec0Table *)pVtab);
+  Vec0Table *p = (Vec0Table *)pVtab;
+  static const char *shadows[] = {"config", "data", "graph", "layers"};
+  for (int i = 0; i < 4; i++) {
+    char *sql = sqlite3_mprintf("DROP TABLE IF EXISTS \"%w\".\"%w_%w\"",
+                                p->schema, p->name, shadows[i]);
+    sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+  }
+  vec0_free(p);
   return SQLITE_OK;
 }
 
