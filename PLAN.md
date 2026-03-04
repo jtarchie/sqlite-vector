@@ -23,6 +23,32 @@ SELECT rowid, distance FROM items WHERE items MATCH vec('[0.1, ...]') LIMIT 10;
 
 ---
 
+## Built so far
+
+- `xmake.lua` — shared lib build targeting `sqlite_vector`; macOS
+  `-undefined dynamic_lookup`; SimSIMD include path
+- `include/sqlite3.h` + `include/sqlite3ext.h` — bundled from Homebrew SQLite
+  3.51.2
+- `third_party/simsimd` — git submodule (ashvardanian/SimSIMD, header-only,
+  Apache-2.0)
+- `src/extension.c` — `sqlite3_sqlitevector_init` entry point; registers `vec0`
+  module
+- `src/vtab.h` — `Vec0Module` extern declaration, `VEC0_MODULE_NAME` constant
+- `src/vtab.c` — `sqlite3_module` with `iVersion=3`; `xCreate`/`xConnect` parse
+  `dims`, `metric`, `m`, `ef_construction`, `ef_search` from argv; dynamic
+  schema declares hidden table-name col at index 0 (enables `MATCH` syntax);
+  `xBestIndex` routes `MATCH` on col 0 → `idxNum=1`; `xShadowName` guards
+  `config`/`data`/`graph`/`layers`; `xUpdate=NULL` (read-only)
+- `test/basic.sql` — smoke test: extension loads, `CREATE VIRTUAL TABLE`,
+  `MATCH` query returns empty without error
+- `.gitignore` — excludes `build/`, `.xmake/`, compiled artifacts
+
+**Not yet built:** `vec_parse.c`, `distance.c`, `hnsw.c`, shadow table creation
+in `xCreate`/`xDestroy`, config read in `xConnect`, `xUpdate` (INSERT/DELETE),
+kNN search in `xFilter`.
+
+---
+
 ## Steps
 
 ### 1. Repository & build scaffold
@@ -260,6 +286,25 @@ Parsed from `argv` in `xCreate` / `xConnect`, written to `_config`:
 | `m=16`                | 16         | HNSW max neighbors per node per layer            |
 | `ef_construction=128` | 128        | Candidate set size during index build            |
 | `ef_search=64`        | 64         | Candidate set size during query                  |
+
+---
+
+## Testing policy
+
+Every feature is implemented alongside its test. **Tests must pass before
+committing.**
+
+- Test file for each source file lives in `test/` with a matching name (e.g.
+  `src/vec_parse.c` → `test/vec_parse.sql` or `test/vec_parse_test.c`).
+- SQL-level behaviour (insert, query, error cases) is tested with `.sql` scripts
+  run via `sqlite3 :memory: < test/foo.sql`. Use `.bail on` at the top of every
+  SQL test so any error aborts.
+- Unit-level behaviour (distance math, parse edge cases) may use small LuaJIT
+  with FFI to test.
+- Run the full test suite after every change:
+  `sqlite3 :memory: < test/basic.sql` (and any new test files).
+- `test/basic.sql` is the integration regression — it grows with each commit and
+  must always pass.
 
 ---
 
