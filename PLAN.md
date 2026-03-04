@@ -1,377 +1,393 @@
-## Plan: SQLite Vector Extension (`sqlite-vector`)
+Research sqlite-vec and pgvector repos
 
-A loadable SQLite extension implementing pgvector-style nearest-neighbor search
-via HNSW, built with xmake, with **no external dependencies**. The HNSW graph is
-stored entirely in SQLite shadow tables — the index _is_ the database. Vectors
-are exposed through a virtual table module named `vec0`, with a `MATCH`-style
-SQL interface.
-
-**Key architectural principle:** No external index library is loaded into RAM.
-The HNSW graph adjacency list is stored in a shadow table backed by SQLite's
-B-tree. A query traversal touches O(ef_search × M) rows — a few hundred rows for
-typical settings — which SQLite's page cache handles efficiently. Memory usage
-at query time is O(ef_search), not O(N). Durability and rollback are free via
-SQLite's WAL.
-
-**SQL interface target:**
-
-```sql
-CREATE VIRTUAL TABLE items USING vec0(dims=1536, metric=cosine);
-INSERT INTO items VALUES (vec('[0.1, 0.2, ...]'));
-SELECT rowid, distance FROM items WHERE items MATCH vec('[0.1, ...]') LIMIT 10;
-```
-
----
-
-## Built so far
-
-- **Build**: `xmake.lua` — shared lib; macOS `-undefined dynamic_lookup`;
-  SimSIMD include path. Bundled `include/sqlite3{,ext}.h` (SQLite 3.51.2).
-  SimSIMD as `third_party/simsimd` git submodule (header-only, Apache-2.0).
-- **`src/extension.c`** — `sqlite3_sqlitevector_init` entry point; registers
-  `vec0` module, `vec_parse` scalars, and distance scalars.
-- **`src/vec_parse.{h,c}`** — `vec_parse()` / `vec_format()`; SQL scalars
-  `vec()`, `vec_dims()`, `vec_norm()`.
-- **`src/distance.{h,c}`** — Six SimSIMD-backed kernels (`l2`, `cosine`, `ip`,
-  `l1`, `hamming`, `jaccard`); `distance_for_metric()` resolver; SQL scalars
-  `vec_distance_*`.
-- **`src/hnsw.{h,c}`** — Full SQL-native HNSW: `hnsw_search`, `hnsw_insert`,
-  `hnsw_delete`. All graph state in shadow tables; C heap holds only candidate
-  heaps (O(ef) nodes). Binary min/max-heaps + sorted visited set. Random-level
-  sampling, bidirectional edge pruning, entry-point election on delete. v2 graph
-  repair on delete: former neighbours are re-wired by running a `search_layer`
-  beam search at each affected layer, then calling `set_connections` to restore
-  up to M connections and adding reverse edges. Optional pre-prepared statement
-  cache (`sc_*` fields in `HnswCtx`, populated from `Vec0Table`) eliminates
-  `sqlite3_prepare_v2`/`sqlite3_finalize` on every call — critical for
-  bulk-insert throughput.
-- **`src/vtab.{h,c}`** — Complete `sqlite3_module` (iVersion=3):
-  `xCreate`/`xConnect`/`xDisconnect`/`xDestroy` (4 shadow tables + config
-  persistence + 7 cached prepared statements on `Vec0Table`); `xBestIndex`
-  (MATCH → kNN, rowid-eq → point lookup, op 151-156 → metric-override kNN,
-  full-scan fallback); `xFilter` calling `hnsw_search` with per-function metric
-  override; full-scan (idxNum=0) reads all rowids from `_data`; `xColumn`
-  fetching vector BLOBs as `[x,y,z]` text; `xUpdate` for INSERT (→
-  `hnsw_insert`), DELETE (→ `hnsw_delete`), and UPDATE (delete + re-insert,
-  rowid-change rejected with SQLITE_MISMATCH); `xFindFunction` intercepting all
-  six `vec_distance_*` functions on vtab columns to route them as index-
-  accelerated kNN (idxNum 151-156: l2, cosine, ip, l1, hamming, jaccard);
-  `xShadowName`.
-- **Tests** (all 12 passing via `test/run_all.sh`): `basic.sql`,
-  `vec_parse.sql`, `distance.sql`, `shadow.sql`, `insert.sql`, `ffi_test.lua`,
-  `shadow_connect` (xConnect persistence), `knn.sql` (kNN
-  ordering/DELETE/UPDATE/ef_search), `operators.sql` (all 6 `vec_distance_*`
-  operator aliases via xFindFunction), `bulk_insert.sql` (BEGIN/COMMIT bulk
-  insert + ROLLBACK correctness), `delete_repair.sql` (graph repair: entry-point
-  deletion, interior-hub deletion, chained deletes), `recall_bench.lua` (HNSW
-  recall@k vs brute-force ground truth).
-
-**Not yet built:** ~~graph repair on delete~~ (done: v2 re-wires affected
-neighbours via `search_layer` + `set_connections` after each delete); ~~batch
-import / bulk-load optimisation~~ (done: prepared-statement cache on `Vec0Table`
-eliminates 5–7 `sqlite3_prepare_v2`/`sqlite3_finalize` calls per row;
-`BEGIN`/`COMMIT` wrapping already gives bulk-load benefits); ~~`ef_search`
-runtime override via SQL~~ (done: hidden `ef_search` column). Nothing remains on
-the original plan.
-
----
-
-## Steps
-
-### 1. Repository & build scaffold
-
-```
-sqlite-vector/
-  xmake.lua               -- build definition
-  include/
-    sqlite3ext.h          -- bundled SQLite extension header
-  third_party/
-    simsimd/              -- git submodule: ashvardanian/SimSIMD (header-only)
-  src/
-    extension.c           -- entry point + module registration
-    vtab.c / vtab.h       -- sqlite3_module implementation
-    vec_parse.c / vec_parse.h  -- text '[...]' ↔ float* parsing
-    distance.c / distance.h    -- distance functions via SimSIMD
-    hnsw.c / hnsw.h            -- HNSW traversal via shadow table SQL
-  test/
-    basic.sql
-```
-
-[xmake.lua](xmake.lua): `set_kind("shared")`, `set_languages("c11")`,
-`add_files("src/*.c")`, `add_includedirs("third_party/simsimd/include")`, macOS
-`-undefined dynamic_lookup` ldflags, Linux `-fPIC`. Output filename
-`sqlite_vector` (entry point: `sqlite3_sqlite_vector_init`).
-
-### 2. Vector parsing & type layer — [src/vec_parse.c](src/vec_parse.c)
-
-Since SQLite has no custom column types, vectors are passed as `TEXT` in
-pgvector's `[1.0,2.0,3.0]` format and stored as raw `float32` BLOBs in shadow
-tables. Implement:
-
-- `vec_parse(const char*, float**, int* dims)` — tokenize, validate, alloc
-- `vec_format(const float*, int dims, char* out)` — float[] → `[x,y,z]` text
-- `vec('[1,2,3]')` scalar SQL function — validates and round-trips the text
-  (identity, for pgvector symmetry)
-- `vec_dims(text|blob)` scalar SQL function — returns dimension count
-- `vec_norm(text)` scalar SQL function — returns L2 norm
-
-### 3. Shadow table schema — created in `xCreate`, dropped in `xDestroy`
-
-For a virtual table named `items`, four shadow tables are created:
-
-```sql
--- Persisted configuration
-CREATE TABLE items_config (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-) WITHOUT ROWID;
--- keys: dims, metric, m, ef_construction, entry_point, max_layer, count
-
--- Raw vector storage; id == user-visible rowid
-CREATE TABLE items_data (
-    id     INTEGER PRIMARY KEY,
-    vector BLOB NOT NULL   -- raw float32, len = dims * 4 bytes
-);
-
--- HNSW graph: directed adjacency list
--- SQLite's B-tree makes (layer, node_id) lookups O(log N)
-CREATE TABLE items_graph (
-    layer       INTEGER NOT NULL,
-    node_id     INTEGER NOT NULL,
-    neighbor_id INTEGER NOT NULL,
-    distance    REAL    NOT NULL,
-    PRIMARY KEY (layer, node_id, neighbor_id)
-) WITHOUT ROWID;
-
--- Per-node maximum layer (for entry-point and level assignment)
-CREATE TABLE items_layers (
-    node_id   INTEGER PRIMARY KEY,
-    max_layer INTEGER NOT NULL
-) WITHOUT ROWID;
-```
-
-`xShadowName` returns 1 for `"config"`, `"data"`, `"graph"`, `"layers"`.
-
-`sqlite3_declare_vtab` schema:
-
-```sql
-CREATE TABLE x(vector TEXT, distance REAL HIDDEN)
-```
-
-`vector` — user-facing column; `distance` — hidden output populated during kNN
-scan.
-
-### 4. Virtual table module (`sqlite3_module`) — [src/vtab.c](src/vtab.c)
-
-Implement all required callbacks with `iVersion = 3`:
-
-| Callback           | Responsibility                                                                                                                                                       |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `xCreate`          | Create 4 shadow tables, write config defaults, call `sqlite3_declare_vtab`                                                                                           |
-| `xConnect`         | Read config from `_config` into vtab struct; no data loaded into RAM                                                                                                 |
-| `xDisconnect`      | Free vtab struct (no in-memory index to release)                                                                                                                     |
-| `xDestroy`         | `DROP TABLE` all 4 shadow tables, free vtab struct                                                                                                                   |
-| `xBestIndex`       | Detect `SQLITE_INDEX_CONSTRAINT_FUNCTION` for `MATCH` + `SQLITE_INDEX_CONSTRAINT_LIMIT`; `idxNum=1`, low `estimatedCost`; full-scan fallback `idxNum=0`              |
-| `xOpen` / `xClose` | Alloc/free cursor; cursor holds a heap array of `(rowid, distance)` results populated by `xFilter`                                                                   |
-| `xFilter`          | Parse query vector from `argv[0]`, read `LIMIT` from `argv[1]`, call HNSW search (step 5), store result array in cursor                                              |
-| `xNext` / `xEof`   | Advance/check cursor position in result array                                                                                                                        |
-| `xColumn`          | col 0 (`vector`): fetch BLOB from `_data`, format as text; col 1 (`distance`): return stored distance                                                                |
-| `xRowid`           | Return current result rowid                                                                                                                                          |
-| `xUpdate`          | INSERT: validate dims, write to `_data`, call HNSW insert; DELETE: remove from `_data`, `_graph`, `_layers`, update entry point if needed; UPDATE: delete + reinsert |
-| `xFindFunction`    | Intercept `"match"` (nArg=2) → kNN path; intercept `"<->"`, `"<=>"`, `"<#>"`, `"<+>"` as distance constraints returning `SQLITE_INDEX_CONSTRAINT_FUNCTION` (150)     |
-| `xShadowName`      | Return 1 for `"config"`, `"data"`, `"graph"`, `"layers"`                                                                                                             |
-
-No `xCommit` / `xRollback` needed — SQLite's own transaction machinery covers
-the shadow tables automatically.
-
-### 5. SQL-native HNSW traversal — [src/hnsw.c](src/hnsw.c)
-
-The HNSW algorithm is implemented in C, issuing `sqlite3_prepare`/`sqlite3_step`
-queries against the shadow tables. No index data ever lives outside SQLite's
-page cache.
-
-**Prepared statements cached on the vtab struct:**
-
-```sql
--- Fetch neighbors for a node at a given layer
-SELECT neighbor_id, distance FROM {name}_graph
-WHERE layer = ? AND node_id = ?;
-
--- Insert/replace a directed edge
-INSERT OR REPLACE INTO {name}_graph(layer, node_id, neighbor_id, distance)
-VALUES (?, ?, ?, ?);
-
--- Delete all edges for a node
-DELETE FROM {name}_graph WHERE node_id = ? OR neighbor_id = ?;
-
--- Fetch vector BLOB by rowid
-SELECT vector FROM {name}_data WHERE id = ?;
-
--- Read / write a config value
-SELECT value FROM {name}_config WHERE key = ?;
-UPDATE {name}_config SET value = ? WHERE key = ?;
-```
-
-**`hnsw_search(vtab, query_vec, k, ef_search)` → result array:**
-
-1. Read `entry_point` and `max_layer` from config.
-2. Greedy descend layers `max_layer` → 1: fetch neighbors via `_graph`, compute
-   distance, track current best.
-3. At layer 0: maintain a max-heap of size `ef_search` candidates; expand each
-   candidate's neighbors, prune heap. Return top-k sorted by distance.
-4. All heap structures live in C heap; only neighbor-row fetches touch SQLite
-   pages.
-
-**`hnsw_insert(vtab, rowid, vec)` → void:**
-
-1. Sample random level `l = floor(-ln(uniform()) * 1/ln(M))`.
-2. Write to `_data` and `_layers`.
-3. Descend from `max_layer` → `l+1` to find entry to lower layers.
-4. At each layer ≤ l: find `ef_construction` nearest neighbors, select best `M`
-   (or `M0 = 2M` at layer 0), write edges bidirectionally to `_graph` with
-   heuristic neighbor pruning.
-5. Update `entry_point` / `max_layer` in `_config` if new node's level exceeds
-   current.
-
-**`hnsw_delete(vtab, rowid)` → void:**
-
-1. Remove rows from `_data` and `_layers`.
-2. Delete all `_graph` edges where `node_id = rowid OR neighbor_id = rowid`.
-3. If deleted node was the entry point, scan `_layers` for a new
-   `MAX(max_layer)` candidate and reassign.
-4. v1: no graph repair — deleted nodes leave edges sparser but traversal skips
-   missing nodes gracefully.
-
-### 6. Distance functions — [src/distance.c](src/distance.c)
-
-Distance kernels are provided by
-[SimSIMD](https://github.com/ashvardanian/SimSIMD) (Apache-2.0, header-only,
-`third_party/simsimd/include/simsimd/simsimd.h`). SimSIMD dispatches to AVX-512,
-AVX2, ARM Neon, or SVE at runtime, falling back to scalar. This is significant
-at high dimensions (1536+) where `dist_fn` is called O(ef_search × M × layers) ≈
-1000 times per query.
-
-```c
-#include "simsimd/simsimd.h"
-
-simsimd_distance_t dist;
-simsimd_cos_f32(a, b, dims, &dist);    // cosine
-simsimd_l2sq_f32(a, b, dims, &dist);   // L2 squared
-simsimd_dot_f32(a, b, dims, &dist);    // inner product
-simsimd_l1_f32(a, b, dims, &dist);     // L1 / Manhattan
-simsimd_hamming_b8(a, b, bytes, &dist); // hamming (bit vectors)
-simsimd_jaccard_b8(a, b, bytes, &dist); // jaccard (bit vectors)
-```
-
-Note: `dist_ip` is stored negated (`-dot`) so ORDER BY ASC returns nearest
-first, matching pgvector's `<#>` convention.
-
-A `dist_fn` function pointer on the vtab struct selects the active metric at
-query time.
-
-Register as SQL scalar functions via `sqlite3_create_function_v2` with
-`SQLITE_DETERMINISTIC`: `vec_distance_l2`, `vec_distance_cosine`,
-`vec_distance_ip`, `vec_distance_l1`, `vec_distance_hamming`,
-`vec_distance_jaccard`.
-
-### 7. Extension entry point — [src/extension.c](src/extension.c)
-
-```c
-int sqlite3_sqlitevector_init(sqlite3 *db, char **pzErrMsg,
-                               const sqlite3_api_routines *pApi)
-{
-    SQLITE_EXTENSION_INIT2(pApi);
-    sqlite3_create_module_v2(db, "vec0", &vectorModule, NULL, NULL);
-    // register scalar distance functions (step 6)
-    // register vec(), vec_dims(), vec_norm() (step 2)
-    return SQLITE_OK;
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "repo": "sqlite-vec",
+  "path": "/"
 }
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "pgvector",
+  "repo": "pgvector",
+  "path": "/"
+}
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/extension.c)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/vtab.c#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/hnsw.c#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/distance.c#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/vec_parse.c#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/PLAN.md#1-1), lines 1 to 200
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/xmake.lua)
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "tests",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "benchmarks",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "pgvector",
+  "path": "test",
+  "repo": "pgvector"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "test.sql",
+  "repo": "sqlite-vec"
+}
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/vtab.c#100-100), lines 100 to 150
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/vtab.c#150-150), lines 150 to 300
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/knn.sql#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/basic.sql)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/distance.sql)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/operators.sql#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/bulk_insert.sql)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/delete_repair.sql#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/recall_bench.lua#1-1), lines 1 to 150
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/vec_parse.sql)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/shadow.sql)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/insert.sql)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/atomic_update.sql#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/run_all.sh)
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "tests/test-loadable.py",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "tests/test-insert-delete.py",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "tests/fuzz.py",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "tests/test-knn-distance-constraints.py",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "tests/test-metadata.py",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "tests/test-auxiliary.py",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "tests/test-partition-keys.py",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "benchmarks/micro",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "benchmarks/exhaustive-memory",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "pgvector",
+  "path": "test/sql",
+  "repo": "pgvector"
+}
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/distance.c#100-100), lines 100 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/vec_parse.c#100-100), lines 100 to 216
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/hnsw.h)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/distance.h)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/vtab.h)
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/ffi_test.lua#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/persist_test.lua#1-1), lines 1 to 100
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/test/shadow_setup.sql)
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "pgvector",
+  "path": "test/sql/hnsw_vector.sql",
+  "repo": "pgvector"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "pgvector",
+  "path": "test/sql/vector_type.sql",
+  "repo": "pgvector"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "pgvector",
+  "path": "test/sql/ivfflat_vector.sql",
+  "repo": "pgvector"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "pgvector",
+  "path": "test/sql/halfvec.sql",
+  "repo": "pgvector"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "pgvector",
+  "path": "test/sql/sparsevec.sql",
+  "repo": "pgvector"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "reference.yaml",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "benchmarks/exhaustive-memory/bench.py",
+  "repo": "sqlite-vec"
+}
+
+Ran Get file or directory contents 
+Completed with input: {
+  "owner": "asg017",
+  "path": "benchmarks/micro/benches",
+  "repo": "sqlite-vec"
+}
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/distance.c#100-100), lines 100 to 150
+
+Read [](file:///Users/jtarchie/workspace/sqlite-vector/src/vtab.c#1100-1100), lines 1100 to 1266
+
+That's a thorough report. Let me ask a few scoping questions before drafting the plan, since the gap list is large and priorities matter. 
+
+Asked 4 questions (Focus, New features, Bench scale, Test tooling)
+
+Here's the comprehensive plan:
+
+---
+
+## Plan: Expand Testing, Benchmarking & Features
+
+The project currently has solid correctness tests for its core HNSW + kNN path, but is missing edge-case error handling, error message assertions, fuzzing, distance-threshold filtering, element-wise vector ops, metadata columns, typed vector types, and any industry-scale benchmarking. We'll work across all three tracks in parallel, keeping the existing Lua + SQL tooling.
+
+---
+
+### Track 1 — Close Testing Gaps
+
+**1.1 Error message assertions**
+
+Extend insert.sql to capture the exact SQLite error text on dimension mismatch (e.g. `"Expected 3 dimensions but got 4"`) using `.catch` or `;` error trapping in the Lua wrapper. Extend ffi_test.lua to assert the error string via the FFI `errmsg` call. Mirror what sqlite-vec does in its `test-insert-delete.py`.
+
+**1.2 Parsing edge cases**
+
+Add `test/vec_parse_edge.sql` covering:
+- Empty: `vec('[]')`
+- Malformed: `vec('[1,]')`, `vec('[,]')`, `vec('[1,,3]')`, `vec('[1a]')`, `vec('[1,2,3')`  (unterminated)
+- Special floats: `vec('[inf]')`, `vec('[nan]')`, `vec('[-inf]')`  — decide policy (reject or allow) and assert consistently
+- Trailing garbage: `vec('[1,2,3]9')`
+- Overflow / underflow floats
+
+**1.3 Input validation limits**
+
+Add guards in vtab.c for: `dims = 0`, `dims > 8192` (match sqlite-vec's cap), and `LIMIT > 4096` on kNN. Add assertions in insert.sql / ffi_test.lua for each error.
+
+**1.4 Hamming/Jaccard semantic guards**
+
+The current distance.c implements `vec_distance_hamming` and `vec_distance_jaccard` by reinterpreting float32 memory as bytes, which is semantically wrong for float inputs. Either (a) enforce that these functions require a dedicated bitvector type (see Track 3, item 3.5), or (b) document and test the current byte-reinterpretation contract explicitly. Add `test/hamming_jaccard.sql` with known-answer tests on byte-aligned bit patterns.
+
+**1.5 Empty-table edge cases**
+
+Add a test (extend delete_repair.sql or new file) that:
+- Deletes all rows, then runs a kNN MATCH — expects 0 results, no crash
+- Inserts after full deletion — confirms correct count and navigable graph
+
+**1.6 WAL mode persistence**
+
+Add `test/wal_persist.lua` (parallel to persist_test.lua) that:
+- Opens file-based DB with `PRAGMA journal_mode=WAL`
+- Inserts vectors, checkpoints, closes, reopens
+- Verifies config values and kNN results survive
+
+**1.7 EXPLAIN QUERY PLAN output**
+
+Extend ffi_test.lua to run `EXPLAIN QUERY PLAN` on each index path (idxNum 0, 1, 2, 151–156) and assert the `detail` column contains expected strings (e.g. `"MATCH"` for kNN, `"SCAN"` for full table scan).
+
+**1.8 Fuzz / crash-safety sweep**
+
+Add `test/fuzz.lua` that calls every registered SQL function with obviously bad inputs (`NULL`, empty string, `""`, integer, float, `'\x00'`, huge string) and asserts SQLite doesn't crash (only `SQLITE_ERROR` or `SQLITE_OK` are acceptable return codes).
+
+**1.9 RENAME TABLE**
+
+Once `xRename` is implemented (Track 3, item 3.6), add `test/rename.sql` asserting shadow tables are renamed and kNN still works post-rename.
+
+---
+
+### Track 2 — Benchmarking
+
+**2.1 Enhance `recall_bench.lua` (CI-compatible, ≤100K vectors)**
+
+Augment recall_bench.lua with:
+- Query latency: wall-clock per query → report min/p50/p95/p99/max using `socket.gettime` or `os.clock`
+- QPS (queries per second)
+- Delete throughput (deletes/second for N random deletions)
+- A brute-force baseline using `vec_distance_*` full-scan, so recall and speed are compared against ground truth in the same run
+- Structured output (CSV or JSON) to `bench/results/` for easy graphing
+
+**2.2 Parameter sweep script (CI-compatible)**
+
+New `bench/param_sweep.lua` that loops over a grid of `(M, ef_construction, ef_search)` values and records recall@10 and QPS for each combination. Outputs a table to stdout and a CSV. This directly answers the "M × ef_construction trade-off" question that neither sqlite-vec nor pgvector benchmarks.
+
+**2.3 Large-scale benchmark (separate, not in CI)**
+
+New `bench/sift_bench.lua` targeting 1M × 128D:
+- Downloads or generates synthetic SIFT-1M-shaped data (128D float32, 1M vectors, 10K queries)
+- Measures insert throughput in batches of 10K
+- Measures kNN latency at `k=10`, `k=100`
+- Optionally runs `PRAGMA page_size` variations (4096, 8192, 16384, 65536)
+- Compares HNSW kNN vs brute-force scan (`vec_distance_l2` full table scan) for recall and latency
+- Compares `journal_mode=DELETE` vs `journal_mode=WAL` for insert throughput
+
+**2.4 Memory tracking**
+
+In `bench/sift_bench.lua`, sample `/proc/self/status` (Linux) or `ps -o rss` (macOS) at: before index build, after 100K inserts, after 500K inserts, after 1M inserts. Report RSS growth trend to identify memory leak risk.
+
+---
+
+### Track 3 — New Features
+
+Each feature below needs: C implementation, function registration in extension.c, and a corresponding SQL test file.
+
+**3.1 Element-wise vector ops: `vec_add`, `vec_sub`, `vec_normalize`**
+
+Add to distance.c (or a new `src/vec_ops.c`):
+- `vec_add(a TEXT, b TEXT) → TEXT`: element-wise sum, same dims required
+- `vec_sub(a TEXT, b TEXT) → TEXT`: element-wise difference
+- `vec_normalize(v TEXT) → TEXT`: divide each element by L2 norm (unit vector)
+
+Register in extension.c. Test in `test/vec_ops.sql` with known-answer assertions.
+
+**3.2 `vec_slice(v, start, end) → TEXT`**
+
+Extracts a contiguous subvector (0-indexed, exclusive end). Useful for Matryoshka embeddings. Add to vec_parse.c. Test in `test/vec_ops.sql`.
+
+**3.3 Distance threshold constraints (`AND distance < X`)**
+
+Modify `xBestIndex` in vtab.c to detect `SQLITE_INDEX_CONSTRAINT_LT/LE/GT/GE` or `BETWEEN` on the `distance` column when a MATCH constraint is also present. Pass the threshold value(s) via `aConstraintUsage`. In the kNN path of `xFilter`, post-filter the HNSW result set against the threshold before returning rows. New `test/distance_constraints.sql`.
+
+**3.4 Metadata columns in `vec0`**
+
+This is the largest feature. The declaration syntax becomes:
+```sql
+CREATE VIRTUAL TABLE vecs USING vec0(dims=3, metric=l2, name TEXT, score REAL);
 ```
 
-### 8. MATCH operator wiring
+Changes required:
+- Parse extra `name TYPE` pairs in `xCreate`/`xConnect` in vtab.c
+- Create a `{name}_meta` shadow table with `(id INTEGER PRIMARY KEY, ...)` for each metadata column
+- Extend `xColumn` to read from the meta table for non-hidden, non-vector columns
+- Extend `xUpdate` (INSERT/UPDATE) to write metadata alongside the vector
+- Extend `xBestIndex` to recognize equality/range constraints on metadata columns and pass them as post-filters on the kNN result set (or as a pre-filter in the full-scan path)
+- New `test/metadata.sql`
 
-`WHERE items MATCH vec('[...]')` desugars to `match(items, '[...]')`. In
-`xFindFunction`, intercept:
+**3.5 Typed vector types: `vec_int8`, `vec_bit` constructors and `vec_type()`**
 
-- `"match"` with `nArg=2` → kNN path (`idxNum=1`), return 150
-  (`SQLITE_INDEX_CONSTRAINT_FUNCTION`)
-- `"<->"`, `"<=>"`, `"<#>"`, `"<+>"` → same kNN path with per-call metric
-  override
+Introduce BLOB subtype tagging (mirroring sqlite-vec's subtype 223/224/225 approach):
+- `vec_f32(text|blob) → BLOB` with subtype 223: normalizes to raw float32 little-endian BLOB
+- `vec_int8(text|blob) → BLOB` with subtype 225: normalizes to raw int8 BLOB
+- `vec_bit(blob) → BLOB` with subtype 224: validates packed bit BLOB
+- `vec_type(v) → TEXT`: returns `'float32'`, `'int8'`, or `'bit'`
+- Update `vec_distance_hamming` and `vec_distance_jaccard` in distance.c to require subtype 224 (bitvector) input and raise `SQLITE_ERROR` otherwise
+- New `test/vector_types.sql`
 
-Both paths arrive in `xFilter` as `argv[0]` = query vector text, `argv[1]` =
-limit. `xFilter` calls `hnsw_search`, populates cursor result array, and
-`xNext`/`xColumn` iterate it.
+**3.6 RENAME TABLE (`xRename`)**
 
-### 9. `CREATE VIRTUAL TABLE` options
-
-Parsed from `argv` in `xCreate` / `xConnect`, written to `_config`:
-
-| Option                | Default    | Description                                      |
-| --------------------- | ---------- | ------------------------------------------------ |
-| `dims=N`              | (required) | Vector dimensionality                            |
-| `metric=...`          | `l2`       | `cosine`, `l2`, `ip`, `l1`, `hamming`, `jaccard` |
-| `m=16`                | 16         | HNSW max neighbors per node per layer            |
-| `ef_construction=128` | 128        | Candidate set size during index build            |
-| `ef_search=64`        | 64         | Candidate set size during query                  |
+Implement `xRename` in vtab.c by executing `ALTER TABLE {old}_config RENAME TO {new}_config` etc. for all 4 shadow tables, and updating the in-memory `vtab` state. Test in `test/rename.sql`.
 
 ---
 
-## Testing policy
+### Verification
 
-Every feature is implemented alongside its test. **Tests must pass before
-committing.**
-
-- Test file for each source file lives in `test/` with a matching name (e.g.
-  `src/vec_parse.c` → `test/vec_parse.sql` or `test/vec_parse_test.c`).
-- SQL-level behaviour (insert, query, error cases) is tested with `.sql` scripts
-  run via `sqlite3 :memory: < test/foo.sql`. Use `.bail on` at the top of every
-  SQL test so any error aborts.
-- Unit-level behaviour (distance math, parse edge cases) may use small LuaJIT
-  with FFI to test.
-- Run the full test suite after every change:
-  `sqlite3 :memory: < test/basic.sql` (and any new test files).
-- `test/basic.sql` is the integration regression — it grows with each commit and
-  must always pass.
+- All existing run_all.sh tests must still pass after each change
+- Add new tests to run_all.sh as they're created
+- Benchmark scripts in `bench/` are run separately: `luajit bench/param_sweep.lua` and `luajit bench/sift_bench.lua`
+- For the large-scale benchmark, define a minimum acceptable recall threshold (suggest ≥ 0.90 at default M=16, ef_search=64 on SIFT-1M)
 
 ---
 
-## Verification
-
-1. **Build**: `xmake -v` → produces `build/libsqlite_vector.dylib` (macOS) or
-   `.so` (Linux).
-2. **Smoke test**:
-   ```sql
-   .load ./build/libsqlite_vector
-   CREATE VIRTUAL TABLE vecs USING vec0(dims=3, metric=cosine);
-   INSERT INTO vecs VALUES (vec('[1.0, 0.0, 0.0]'));
-   INSERT INTO vecs VALUES (vec('[0.0, 1.0, 0.0]'));
-   SELECT rowid, distance FROM vecs WHERE vecs MATCH vec('[1.0, 0.1, 0.0]') LIMIT 2;
-   ```
-3. **Persistence**: close and reopen the DB, repeat the query — results are
-   identical; no reload step needed since the graph lives in shadow tables.
-4. **Rollback**: `BEGIN; INSERT ...; ROLLBACK;` → vector absent from results and
-   from `vecs_data`.
-5. **Scalar functions**: `SELECT vec_distance_l2('[1,0]', '[0,1]');` →
-   `1.4142...`
-6. **All metrics**: create 6 virtual tables (one per metric), insert vectors,
-   query each.
-7. **Shadow table inspection**: `SELECT * FROM vecs_graph LIMIT 20;` — readable
-   adjacency list.
-
----
-
-## Decisions
-
-- **SQL-native HNSW graph**: stored in shadow tables; SQLite's page cache
-  handles partial loading. Memory at query time is O(ef_search), not O(N).
-  Rollback and durability are free via SQLite WAL — no `xCommit`/`xRollback`
-  needed.
-- **SimSIMD for distance kernels**: header-only submodule (Apache-2.0); provides
-  SIMD-accelerated L2, cosine, IP, L1, Hamming, Jaccard with runtime CPU
-  dispatch. The HNSW graph itself remains pure C + SQLite.
-- **MATCH interface only**: Cleaner SQL, matches FTS5 muscle memory. Operator
-  aliases (`<->` etc.) wired through `xFindFunction`.
-- **Text encoding `[1.0,2.0,3.0]`** for user-facing values; stored as raw
-  `float32` BLOB in `_data` for efficiency.
-- **`vec0` module name**: matches the sqlite-vec naming convention, avoiding
-  conflicts with any future official SQLite vector module.
+**Decisions**
+- Test tooling stays Lua + SQL; no Python/pytest introduced
+- Benchmark scale: small scripts stay in test, large scripts go in a new top-level `bench/` directory
+- Metadata columns use a new `_meta` shadow table rather than packing into `_data` (keeps the hot HNSW path clean)
+- Typed vector types use SQLite subtype markers (not a new column type tag) for backward compatibility with existing `vec()` TEXT path
