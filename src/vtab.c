@@ -363,15 +363,15 @@ static void op_dist_fn(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   (void)pVtab;
 
-  /* 0. Operator-alias kNN constraints (op 151-154, set by xFindFunction). */
+  /* 0. Operator-alias kNN constraints (op 151-156, set by xFindFunction). */
   for (int i = 0; i < pInfo->nConstraint; i++) {
     if (!pInfo->aConstraint[i].usable)
       continue;
     int op = pInfo->aConstraint[i].op;
-    if (op >= 151 && op <= 154) {
+    if (op >= 151 && op <= 156) {
       pInfo->aConstraintUsage[i].argvIndex = 1;
       pInfo->aConstraintUsage[i].omit = 1;
-      pInfo->idxNum = op; /* 151=l2, 152=cosine, 153=ip, 154=l1 */
+      pInfo->idxNum = op; /* 151=l2 152=cosine 153=ip 154=l1 155=hamming 156=jaccard */
       pInfo->estimatedCost = 10.0;
       pInfo->estimatedRows = 10;
       return SQLITE_OK;
@@ -522,8 +522,8 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
     return SQLITE_OK;
   }
 
-  /* kNN path: idxNum==1 (MATCH) or idxNum 151-154 (operator alias) */
-  if (idxNum != 1 && (idxNum < 151 || idxNum > 154))
+  /* kNN path: idxNum==1 (MATCH) or idxNum 151-156 (operator alias) */
+  if (idxNum != 1 && (idxNum < 151 || idxNum > 156))
     return SQLITE_OK; /* unknown index — return empty */
 
   Vec0Table *p = (Vec0Table *)pCursor->pVtab;
@@ -557,8 +557,8 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
 
   /* Resolve distance function: operator alias overrides table metric */
   dist_fn_t knn_dist_fn = p->dist_fn;
-  if (idxNum >= 151 && idxNum <= 154) {
-    static const char *op_metrics[] = {"l2", "cosine", "ip", "l1"};
+  if (idxNum >= 151 && idxNum <= 156) {
+    static const char *op_metrics[] = {"l2", "cosine", "ip", "l1", "hamming", "jaccard"};
     dist_fn_t override = distance_for_metric(op_metrics[idxNum - 151]);
     if (override)
       knn_dist_fn = override;
@@ -914,10 +914,12 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
  * Intercept vec_distance_* calls on a vtab column so SQLite routes them
  * through xBestIndex as index-accelerated kNN scans.
  * Returns a nonzero code that becomes aConstraint[i].op in xBestIndex.
- *   151 = vec_distance_l2      (L2 / Euclidean)
- *   152 = vec_distance_cosine  (cosine)
- *   153 = vec_distance_ip      (inner product)
- *   154 = vec_distance_l1      (L1 / Manhattan)
+ *   151 = vec_distance_l2      (L2 / Euclidean)       <->
+ *   152 = vec_distance_cosine  (cosine distance)       <=>
+ *   153 = vec_distance_ip      (inner product)         <#>
+ *   154 = vec_distance_l1      (L1 / Manhattan)        <+>
+ *   155 = vec_distance_hamming (Hamming, binary vecs)  <~>
+ *   156 = vec_distance_jaccard (Jaccard, binary vecs)  <%>
  *
  * When used on regular (non-vtab) columns the pre-registered scalars in
  * distance.c handle the call normally — xFindFunction is never invoked.
@@ -948,6 +950,16 @@ static int vec0FindFunction(sqlite3_vtab *pVtab, int nArg, const char *zName,
     *pxFunc = op_dist_fn;
     *ppArg = (void *)"l1";
     return 154;
+  }
+  if (strcmp(zName, "vec_distance_hamming") == 0) {
+    *pxFunc = op_dist_fn;
+    *ppArg = (void *)"hamming";
+    return 155;
+  }
+  if (strcmp(zName, "vec_distance_jaccard") == 0) {
+    *pxFunc = op_dist_fn;
+    *ppArg = (void *)"jaccard";
+    return 156;
   }
   return 0;
 }

@@ -105,4 +105,42 @@ CREATE TEMP TABLE op_override AS
 INSERT INTO assert VALUES((SELECT rowid FROM op_override) = 1);
 INSERT INTO assert VALUES((SELECT distance FROM op_override) < 1e-5);
 
+-- ── vec_distance_hamming: Hamming kNN (idxNum=155) ────────────────────────
+-- Hamming treats the stored float32 BLOB as a raw bitstring.
+-- Identical vectors have Hamming distance 0; different float32 patterns differ.
+CREATE VIRTUAL TABLE vham USING vec0(dims=3, metric=hamming, ef_search=10);
+INSERT INTO vham(vector) VALUES(vec('[1.0,0.0,0.0]'));  -- rowid 1
+INSERT INTO vham(vector) VALUES(vec('[0.0,1.0,0.0]'));  -- rowid 2
+INSERT INTO vham(vector) VALUES(vec('[0.0,0.0,1.0]'));  -- rowid 3
+
+CREATE TEMP TABLE op_ham AS
+  SELECT rowid, distance
+  FROM vham
+  WHERE vec_distance_hamming(vham, '[1.0,0.0,0.0]')
+  LIMIT 3;
+
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM op_ham) = 3);
+-- Nearest to [1,0,0] is itself (rowid 1, distance 0)
+INSERT INTO assert VALUES((SELECT rowid    FROM op_ham ORDER BY distance LIMIT 1) = 1);
+INSERT INTO assert VALUES((SELECT distance FROM op_ham ORDER BY distance LIMIT 1) = 0.0);
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM op_ham WHERE distance IS NULL) = 0);
+
+-- ── vec_distance_jaccard: Jaccard kNN (idxNum=156) ────────────────────────
+-- Jaccard treats the BLOB as a bitstring; identical vectors → distance 0.
+CREATE VIRTUAL TABLE vjac USING vec0(dims=3, metric=jaccard, ef_search=10);
+INSERT INTO vjac(vector) VALUES(vec('[1.0,0.0,0.0]'));  -- rowid 1
+INSERT INTO vjac(vector) VALUES(vec('[0.0,1.0,0.0]'));  -- rowid 2
+INSERT INTO vjac(vector) VALUES(vec('[0.0,0.0,1.0]'));  -- rowid 3
+
+CREATE TEMP TABLE op_jac AS
+  SELECT rowid, distance
+  FROM vjac
+  WHERE vec_distance_jaccard(vjac, '[1.0,0.0,0.0]')
+  LIMIT 3;
+
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM op_jac) = 3);
+INSERT INTO assert VALUES((SELECT rowid    FROM op_jac ORDER BY distance LIMIT 1) = 1);
+INSERT INTO assert VALUES((SELECT distance FROM op_jac ORDER BY distance LIMIT 1) = 0.0);
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM op_jac WHERE distance IS NULL) = 0);
+
 SELECT 'operators tests passed';
