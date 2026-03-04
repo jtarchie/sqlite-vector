@@ -33,5 +33,7 @@ run "shadow"         sqlite3 :memory: < test/shadow.sql
 run "insert"         sqlite3 :memory: < test/insert.sql
 run "ffi"            luajit test/ffi_test.lua
 run "shadow_connect" sh test/wrappers/run_shadow_connect.sh
+run "knn"            sqlite3 :memory: < test/knn.sql
+run "operators"      sqlite3 :memory: < test/operators.sql
 
 echo "==> All tests passed."

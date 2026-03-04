@@ -311,11 +311,72 @@ static int vec0Destroy(sqlite3_vtab *pVtab) {
   return SQLITE_OK;
 }
 
+/* ── Operator-alias distance scalar ──────────────────────────────────────────
+ * Used as the *pxFunc returned by xFindFunction for <->, <=>, <#>, <+>.
+ * sqlite3_user_data() carries the metric name string (static literal).
+ */
+static void op_dist_fn(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  const char *metric = (const char *)sqlite3_user_data(ctx);
+  dist_fn_t fn = distance_for_metric(metric);
+  if (!fn) {
+    sqlite3_result_error(ctx, "vec0: unknown metric", -1);
+    return;
+  }
+  if (sqlite3_value_type(argv[0]) == SQLITE_NULL ||
+      sqlite3_value_type(argv[1]) == SQLITE_NULL) {
+    sqlite3_result_null(ctx);
+    return;
+  }
+  const char *ta = (const char *)sqlite3_value_text(argv[0]);
+  const char *tb = (const char *)sqlite3_value_text(argv[1]);
+  float *va = NULL, *vb = NULL;
+  int da = 0, db = 0;
+  char *err = NULL;
+  if (vec_parse(ta, &va, &da, &err) != SQLITE_OK) {
+    sqlite3_result_error(ctx, err ? err : "vec0: invalid vector", -1);
+    sqlite3_free(err);
+    return;
+  }
+  if (vec_parse(tb, &vb, &db, &err) != SQLITE_OK) {
+    sqlite3_free(va);
+    sqlite3_result_error(ctx, err ? err : "vec0: invalid vector", -1);
+    sqlite3_free(err);
+    return;
+  }
+  if (da != db) {
+    sqlite3_free(va);
+    sqlite3_free(vb);
+    sqlite3_result_error(ctx, "vec0: dimension mismatch", -1);
+    return;
+  }
+  double dist = 0.0;
+  fn(va, vb, da, &dist);
+  sqlite3_free(va);
+  sqlite3_free(vb);
+  sqlite3_result_double(ctx, dist);
+}
+
 /* ── xBestIndex ──────────────────────────────────────────────────────────────
  */
 
 static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   (void)pVtab;
+
+  /* 0. Operator-alias kNN constraints (op 151-154, set by xFindFunction). */
+  for (int i = 0; i < pInfo->nConstraint; i++) {
+    if (!pInfo->aConstraint[i].usable)
+      continue;
+    int op = pInfo->aConstraint[i].op;
+    if (op >= 151 && op <= 154) {
+      pInfo->aConstraintUsage[i].argvIndex = 1;
+      pInfo->aConstraintUsage[i].omit = 1;
+      pInfo->idxNum = op; /* 151=l2, 152=cosine, 153=ip, 154=l1 */
+      pInfo->estimatedCost = 10.0;
+      pInfo->estimatedRows = 10;
+      return SQLITE_OK;
+    }
+  }
 
   /* 1. Look for a MATCH constraint on col 0 (the hidden table-name column).
    * WHERE vecs MATCH query  →  kNN path */
@@ -461,7 +522,10 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
     return SQLITE_OK;
   }
 
-  /* kNN path */
+  /* kNN path: idxNum==1 (MATCH) or idxNum 151-154 (operator alias) */
+  if (idxNum != 1 && (idxNum < 151 || idxNum > 154))
+    return SQLITE_OK; /* unknown index — return empty */
+
   Vec0Table *p = (Vec0Table *)pCursor->pVtab;
 
   if (argc < 1 || sqlite3_value_type(argv[0]) == SQLITE_NULL)
@@ -491,6 +555,15 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
       k = lim;
   }
 
+  /* Resolve distance function: operator alias overrides table metric */
+  dist_fn_t knn_dist_fn = p->dist_fn;
+  if (idxNum >= 151 && idxNum <= 154) {
+    static const char *op_metrics[] = {"l2", "cosine", "ip", "l1"};
+    dist_fn_t override = distance_for_metric(op_metrics[idxNum - 151]);
+    if (override)
+      knn_dist_fn = override;
+  }
+
   HnswCtx hctx;
   hctx.db = p->db;
   hctx.schema = p->schema;
@@ -501,7 +574,7 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   hctx.ef_search = p->ef_search;
   hctx.entry_point = p->entry_point;
   hctx.max_layer = p->max_layer;
-  hctx.dist_fn = p->dist_fn;
+  hctx.dist_fn = knn_dist_fn;
 
   HnswResult *results = NULL;
   int nResults = 0;
@@ -662,8 +735,105 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
   /* UPDATE: argv[0] is not NULL (existing row being replaced) */
   if (sqlite3_value_type(argv[0]) != SQLITE_NULL) {
-    pVtab->zErrMsg = sqlite3_mprintf("vec0: UPDATE not yet supported");
-    return SQLITE_CONSTRAINT;
+    sqlite3_int64 old_rowid = sqlite3_value_int64(argv[0]);
+    sqlite3_int64 new_rowid = sqlite3_value_int64(argv[1]);
+    if (new_rowid != old_rowid) {
+      pVtab->zErrMsg = sqlite3_mprintf("vec0: cannot change rowid");
+      return SQLITE_MISMATCH;
+    }
+    if (sqlite3_value_type(argv[3]) == SQLITE_NULL) {
+      pVtab->zErrMsg = sqlite3_mprintf("vec0: vector must not be NULL");
+      return SQLITE_CONSTRAINT;
+    }
+    const char *upd_text = (const char *)sqlite3_value_text(argv[3]);
+    float *upd_vec = NULL;
+    int upd_dims = 0;
+    char *upd_err = NULL;
+    int upd_rc = vec_parse(upd_text, &upd_vec, &upd_dims, &upd_err);
+    if (upd_rc != SQLITE_OK) {
+      pVtab->zErrMsg = upd_err ? upd_err : sqlite3_mprintf("vec0: invalid vector");
+      return SQLITE_ERROR;
+    }
+    if (upd_dims != p->dims) {
+      sqlite3_free(upd_vec);
+      pVtab->zErrMsg =
+          sqlite3_mprintf("vec0: expected %d dims, got %d", p->dims, upd_dims);
+      return SQLITE_CONSTRAINT;
+    }
+
+    /* Delete old row from _data and HNSW graph */
+    char *dsql =
+        sqlite3_mprintf("DELETE FROM \"%w\".\"%w_data\" WHERE id=%lld",
+                        p->schema, p->name, old_rowid);
+    sqlite3_exec(p->db, dsql, NULL, NULL, NULL);
+    sqlite3_free(dsql);
+
+    HnswCtx del_ctx;
+    del_ctx.db = p->db;
+    del_ctx.schema = p->schema;
+    del_ctx.tbl_name = p->name;
+    del_ctx.dims = p->dims;
+    del_ctx.m = p->m;
+    del_ctx.ef_construction = p->ef_construction;
+    del_ctx.ef_search = p->ef_search;
+    del_ctx.entry_point = p->entry_point;
+    del_ctx.max_layer = p->max_layer;
+    del_ctx.dist_fn = p->dist_fn;
+    hnsw_delete(&del_ctx, old_rowid);
+    p->entry_point = del_ctx.entry_point;
+    p->max_layer = del_ctx.max_layer;
+    if (p->count > 0)
+      p->count--;
+
+    /* Re-insert with same rowid */
+    char *ins_sql =
+        sqlite3_mprintf("INSERT INTO \"%w\".\"%w_data\" (id, vector) VALUES (%lld, ?)",
+                        p->schema, p->name, old_rowid);
+    sqlite3_stmt *ins_stmt = NULL;
+    upd_rc = sqlite3_prepare_v2(p->db, ins_sql, -1, &ins_stmt, NULL);
+    sqlite3_free(ins_sql);
+    if (upd_rc != SQLITE_OK) {
+      sqlite3_free(upd_vec);
+      pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+      return upd_rc;
+    }
+    sqlite3_bind_blob(ins_stmt, 1, upd_vec,
+                      upd_dims * (int)sizeof(float), SQLITE_STATIC);
+    upd_rc = sqlite3_step(ins_stmt);
+    sqlite3_finalize(ins_stmt);
+    if (upd_rc != SQLITE_DONE) {
+      sqlite3_free(upd_vec);
+      pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+      return SQLITE_ERROR;
+    }
+    p->count++;
+    *pRowid = old_rowid;
+
+    /* Sync count */
+    char *cnt_sql =
+        sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%lld'"
+                        " WHERE key='count'",
+                        p->schema, p->name, p->count);
+    sqlite3_exec(p->db, cnt_sql, NULL, NULL, NULL);
+    sqlite3_free(cnt_sql);
+
+    /* Re-insert into HNSW graph */
+    HnswCtx ins_ctx;
+    ins_ctx.db = p->db;
+    ins_ctx.schema = p->schema;
+    ins_ctx.tbl_name = p->name;
+    ins_ctx.dims = p->dims;
+    ins_ctx.m = p->m;
+    ins_ctx.ef_construction = p->ef_construction;
+    ins_ctx.ef_search = p->ef_search;
+    ins_ctx.entry_point = p->entry_point;
+    ins_ctx.max_layer = p->max_layer;
+    ins_ctx.dist_fn = p->dist_fn;
+    upd_rc = hnsw_insert(&ins_ctx, old_rowid, upd_vec);
+    sqlite3_free(upd_vec);
+    p->entry_point = ins_ctx.entry_point;
+    p->max_layer = ins_ctx.max_layer;
+    return upd_rc;
   }
 
   /* INSERT: argv[1] is NULL (auto-assign rowid) or an explicit integer. */
@@ -740,6 +910,48 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
   return rc;
 }
 
+/* ── xFindFunction ───────────────────────────────────────────────────────────
+ * Intercept vec_distance_* calls on a vtab column so SQLite routes them
+ * through xBestIndex as index-accelerated kNN scans.
+ * Returns a nonzero code that becomes aConstraint[i].op in xBestIndex.
+ *   151 = vec_distance_l2      (L2 / Euclidean)
+ *   152 = vec_distance_cosine  (cosine)
+ *   153 = vec_distance_ip      (inner product)
+ *   154 = vec_distance_l1      (L1 / Manhattan)
+ *
+ * When used on regular (non-vtab) columns the pre-registered scalars in
+ * distance.c handle the call normally — xFindFunction is never invoked.
+ */
+static int vec0FindFunction(sqlite3_vtab *pVtab, int nArg, const char *zName,
+                             void (**pxFunc)(sqlite3_context *, int,
+                                            sqlite3_value **),
+                             void **ppArg) {
+  (void)pVtab;
+  if (nArg != 2)
+    return 0;
+  if (strcmp(zName, "vec_distance_l2") == 0) {
+    *pxFunc = op_dist_fn;
+    *ppArg = (void *)"l2";
+    return 151;
+  }
+  if (strcmp(zName, "vec_distance_cosine") == 0) {
+    *pxFunc = op_dist_fn;
+    *ppArg = (void *)"cosine";
+    return 152;
+  }
+  if (strcmp(zName, "vec_distance_ip") == 0) {
+    *pxFunc = op_dist_fn;
+    *ppArg = (void *)"ip";
+    return 153;
+  }
+  if (strcmp(zName, "vec_distance_l1") == 0) {
+    *pxFunc = op_dist_fn;
+    *ppArg = (void *)"l1";
+    return 154;
+  }
+  return 0;
+}
+
 /* ── xShadowName ─────────────────────────────────────────────────────────────
  */
 
@@ -774,7 +986,7 @@ sqlite3_module vec0Module = {
     /* xSync       */ NULL,
     /* xCommit     */ NULL,
     /* xRollback   */ NULL,
-    /* xFindFunction */ NULL,
+    /* xFindFunction */ vec0FindFunction,
     /* xRename     */ NULL,
     /* xSavepoint  */ NULL,
     /* xRelease    */ NULL,
