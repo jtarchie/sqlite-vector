@@ -4,6 +4,7 @@
 SQLITE_EXTENSION_INIT1
 
 #include "distance.h"
+#include "vec_ops.h"
 #include "vec_parse.h"
 #include "vtab.h"
 
@@ -25,5 +26,9 @@ int sqlite3_sqlitevector_init(sqlite3 *db, char **pzErrMsg,
     return rc;
 
   rc = distance_register_functions(db);
+  if (rc != SQLITE_OK)
+    return rc;
+
+  rc = vec_ops_register_functions(db);
   return rc;
 }

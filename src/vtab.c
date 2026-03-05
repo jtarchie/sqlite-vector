@@ -14,6 +14,10 @@ SQLITE_EXTENSION_INIT3
 #define VEC0_MAX_LIMIT 4096
 #define VEC0_IDX_FLAG_EF 0x1000
 #define VEC0_IDX_FLAG_LIMIT 0x2000
+#define VEC0_IDX_FLAG_DIST_LT 0x4000
+#define VEC0_IDX_FLAG_DIST_LE 0x8000
+#define VEC0_IDX_FLAG_DIST_GT 0x10000
+#define VEC0_IDX_FLAG_DIST_GE 0x20000
 
 /* ── Internal structs ────────────────────────────────────────────────────────
  */
@@ -543,6 +547,55 @@ static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     }
   }
 
+  /* Distance threshold constraints on column 2 (distance REAL HIDDEN).
+   * For kNN queries, these post-filter the result set.
+   * Process each operator type in separate loops to ensure consistent argv
+   * ordering. */
+  for (int j = 0; j < pInfo->nConstraint; j++) {
+    if (!pInfo->aConstraint[j].usable)
+      continue;
+    if (pInfo->aConstraint[j].iColumn == 2 &&
+        pInfo->aConstraint[j].op == SQLITE_INDEX_CONSTRAINT_LT) {
+      pInfo->aConstraintUsage[j].argvIndex = nextArg++;
+      pInfo->aConstraintUsage[j].omit = 1;
+      flags |= VEC0_IDX_FLAG_DIST_LT;
+      break;
+    }
+  }
+  for (int j = 0; j < pInfo->nConstraint; j++) {
+    if (!pInfo->aConstraint[j].usable)
+      continue;
+    if (pInfo->aConstraint[j].iColumn == 2 &&
+        pInfo->aConstraint[j].op == SQLITE_INDEX_CONSTRAINT_LE) {
+      pInfo->aConstraintUsage[j].argvIndex = nextArg++;
+      pInfo->aConstraintUsage[j].omit = 1;
+      flags |= VEC0_IDX_FLAG_DIST_LE;
+      break;
+    }
+  }
+  for (int j = 0; j < pInfo->nConstraint; j++) {
+    if (!pInfo->aConstraint[j].usable)
+      continue;
+    if (pInfo->aConstraint[j].iColumn == 2 &&
+        pInfo->aConstraint[j].op == SQLITE_INDEX_CONSTRAINT_GT) {
+      pInfo->aConstraintUsage[j].argvIndex = nextArg++;
+      pInfo->aConstraintUsage[j].omit = 1;
+      flags |= VEC0_IDX_FLAG_DIST_GT;
+      break;
+    }
+  }
+  for (int j = 0; j < pInfo->nConstraint; j++) {
+    if (!pInfo->aConstraint[j].usable)
+      continue;
+    if (pInfo->aConstraint[j].iColumn == 2 &&
+        pInfo->aConstraint[j].op == SQLITE_INDEX_CONSTRAINT_GE) {
+      pInfo->aConstraintUsage[j].argvIndex = nextArg++;
+      pInfo->aConstraintUsage[j].omit = 1;
+      flags |= VEC0_IDX_FLAG_DIST_GE;
+      break;
+    }
+  }
+
   /* 0. Operator-alias kNN constraints (op 151-156, set by xFindFunction). */
   for (int i = 0; i < pInfo->nConstraint; i++) {
     if (!pInfo->aConstraint[i].usable)
@@ -730,7 +783,13 @@ static int vec0_filter_knn(Vec0Cursor *cur, int idxNum, int argc,
 
   int has_ef_arg = (idxNum & VEC0_IDX_FLAG_EF) != 0;
   int has_limit_arg = (idxNum & VEC0_IDX_FLAG_LIMIT) != 0;
-  int base_idxnum = idxNum & ~(VEC0_IDX_FLAG_EF | VEC0_IDX_FLAG_LIMIT);
+  int has_dist_lt = (idxNum & VEC0_IDX_FLAG_DIST_LT) != 0;
+  int has_dist_le = (idxNum & VEC0_IDX_FLAG_DIST_LE) != 0;
+  int has_dist_gt = (idxNum & VEC0_IDX_FLAG_DIST_GT) != 0;
+  int has_dist_ge = (idxNum & VEC0_IDX_FLAG_DIST_GE) != 0;
+  int base_idxnum = idxNum & ~(VEC0_IDX_FLAG_EF | VEC0_IDX_FLAG_LIMIT |
+                               VEC0_IDX_FLAG_DIST_LT | VEC0_IDX_FLAG_DIST_LE |
+                               VEC0_IDX_FLAG_DIST_GT | VEC0_IDX_FLAG_DIST_GE);
 
   int ef = p->ef_search;
   int argi = 1;
@@ -757,6 +816,22 @@ static int vec0_filter_knn(Vec0Cursor *cur, int idxNum, int argc,
         k = lim;
     }
     argi++;
+  }
+
+  /* Parse distance threshold constraints */
+  double dist_lt_val = 0.0, dist_le_val = 0.0;
+  double dist_gt_val = 0.0, dist_ge_val = 0.0;
+  if (has_dist_lt && argi < argc) {
+    dist_lt_val = sqlite3_value_double(argv[argi++]);
+  }
+  if (has_dist_le && argi < argc) {
+    dist_le_val = sqlite3_value_double(argv[argi++]);
+  }
+  if (has_dist_gt && argi < argc) {
+    dist_gt_val = sqlite3_value_double(argv[argi++]);
+  }
+  if (has_dist_ge && argi < argc) {
+    dist_ge_val = sqlite3_value_double(argv[argi++]);
   }
 
   dist_fn_t knn_dist_fn = p->dist_fn;
@@ -793,11 +868,26 @@ static int vec0_filter_knn(Vec0Cursor *cur, int idxNum, int argc,
     return SQLITE_NOMEM;
   }
 
+  /* Apply distance threshold post-filters */
+  int filtered_count = 0;
   for (int i = 0; i < nResults; i++) {
-    cur->rowids[i] = results[i].rowid;
-    cur->distances[i] = results[i].dist;
+    double d = results[i].dist;
+    int pass = 1;
+    if (has_dist_lt && d >= dist_lt_val)
+      pass = 0;
+    if (has_dist_le && d > dist_le_val)
+      pass = 0;
+    if (has_dist_gt && d <= dist_gt_val)
+      pass = 0;
+    if (has_dist_ge && d < dist_ge_val)
+      pass = 0;
+    if (pass) {
+      cur->rowids[filtered_count] = results[i].rowid;
+      cur->distances[filtered_count] = d;
+      filtered_count++;
+    }
   }
-  cur->nResults = nResults;
+  cur->nResults = filtered_count;
   sqlite3_free(results);
   return SQLITE_OK;
 }
@@ -812,7 +902,9 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   (void)argv;
 
   Vec0Cursor *cur = (Vec0Cursor *)pCursor;
-  int base_idxnum = idxNum & ~(VEC0_IDX_FLAG_EF | VEC0_IDX_FLAG_LIMIT);
+  int base_idxnum = idxNum & ~(VEC0_IDX_FLAG_EF | VEC0_IDX_FLAG_LIMIT |
+                               VEC0_IDX_FLAG_DIST_LT | VEC0_IDX_FLAG_DIST_LE |
+                               VEC0_IDX_FLAG_DIST_GT | VEC0_IDX_FLAG_DIST_GE);
   vec0_cursor_clear_results(cur);
 
   if (base_idxnum == 0)
