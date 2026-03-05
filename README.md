@@ -250,6 +250,53 @@ BEGIN;
 COMMIT;
 ```
 
+### Linking to Other Content with Explicit rowid
+
+You can specify an explicit `rowid` when inserting vectors to link them to
+related data:
+
+```sql
+-- Create a products table
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY,
+  name TEXT,
+  embedding_id INTEGER
+);
+
+-- Create vector table
+CREATE VIRTUAL TABLE embeddings USING vec0(dims=768);
+
+-- Insert a product
+INSERT INTO products(id, name) VALUES(123, 'Laptop');
+
+-- Later, insert the embedding with matching rowid
+INSERT INTO embeddings(rowid, vector) VALUES(123, vec('[...]'));
+
+-- Now you can join vectors to products directly
+SELECT p.name, e.vector 
+FROM products p
+JOIN embeddings USING(rowid)
+WHERE p.id = 123;
+```
+
+**Use cases for explicit rowids:**
+
+- **Link to external IDs** - Match vector IDs to product IDs, user IDs, document
+  IDs
+- **Cross-database references** - Maintain consistent rowids across multiple
+  databases
+- **Relational integrity** - Ensure vectors correspond to specific entities
+- **Data migration** - Preserve rowid mappings during schema changes
+
+**Auto vs Explicit:** If you don't specify `rowid`, SQLite auto-assigns
+sequential values:
+
+```sql
+INSERT INTO embeddings(vector) VALUES(vec('[...]'));  -- rowid auto-assigned
+
+INSERT INTO embeddings(rowid, vector) VALUES(999, vec('[...]'));  -- explicit rowid
+```
+
 ### Validation
 
 Dimension mismatches are rejected:
