@@ -3,3 +3,6 @@ build/
 *.dylib
 *.so
 *.dll
+
+# Benchmark outputs (generated)
+bench/results/
