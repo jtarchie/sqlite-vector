@@ -8,49 +8,6 @@ tracks in parallel, keeping the existing Lua + SQL tooling.
 
 ---
 
-### Track 2 — Benchmarking
-
-**2.1 Enhance `recall_bench.lua` (CI-compatible, ≤100K vectors)**
-
-Augment recall_bench.lua with:
-
-- Query latency: wall-clock per query → report min/p50/p95/p99/max using
-  `socket.gettime` or `os.clock`
-- QPS (queries per second)
-- Delete throughput (deletes/second for N random deletions)
-- A brute-force baseline using `vec_distance_*` full-scan, so recall and speed
-  are compared against ground truth in the same run
-- Structured output (CSV or JSON) to `bench/results/` for easy graphing
-
-**2.2 Parameter sweep script (CI-compatible)**
-
-New `bench/param_sweep.lua` that loops over a grid of
-`(M, ef_construction, ef_search)` values and records recall@10 and QPS for each
-combination. Outputs a table to stdout and a CSV. This directly answers the "M ×
-ef_construction trade-off" question that neither sqlite-vec nor pgvector
-benchmarks.
-
-**2.3 Large-scale benchmark (separate, not in CI)**
-
-New `bench/sift_bench.lua` targeting 1M × 128D:
-
-- Downloads or generates synthetic SIFT-1M-shaped data (128D float32, 1M
-  vectors, 10K queries)
-- Measures insert throughput in batches of 10K
-- Measures kNN latency at `k=10`, `k=100`
-- Optionally runs `PRAGMA page_size` variations (4096, 8192, 16384, 65536)
-- Compares HNSW kNN vs brute-force scan (`vec_distance_l2` full table scan) for
-  recall and latency
-- Compares `journal_mode=DELETE` vs `journal_mode=WAL` for insert throughput
-
-**2.4 Memory tracking**
-
-In `bench/sift_bench.lua`, sample `/proc/self/status` (Linux) or `ps -o rss`
-(macOS) at: before index build, after 100K inserts, after 500K inserts, after 1M
-inserts. Report RSS growth trend to identify memory leak risk.
-
----
-
 ### Track 3 — New Features
 
 Each feature below needs: C implementation, function registration in
