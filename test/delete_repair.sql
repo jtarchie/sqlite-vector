@@ -114,4 +114,31 @@ INSERT INTO assert VALUES(
   (SELECT COUNT(*) FROM final_knn WHERE distance IS NULL OR distance < 0) = 0
 );
 
+-- ── Empty-table edge case: delete all, query, then reinsert ───────────────
+DELETE FROM vecs;
+
+INSERT INTO assert VALUES(
+  (SELECT value FROM vecs_config WHERE key='count') = '0'
+);
+
+CREATE TEMP TABLE empty_knn AS
+  SELECT rowid, distance FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' LIMIT 4;
+
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM empty_knn) = 0);
+
+INSERT INTO vecs(vector) VALUES(vec('[1.0,0.0,0.0]'));
+INSERT INTO vecs(vector) VALUES(vec('[0.0,1.0,0.0]'));
+
+INSERT INTO assert VALUES(
+  (SELECT value FROM vecs_config WHERE key='count') = '2'
+);
+
+CREATE TEMP TABLE reinsert_knn AS
+  SELECT rowid, distance FROM vecs WHERE vecs MATCH '[1.0,0.0,0.0]' LIMIT 2;
+
+INSERT INTO assert VALUES((SELECT COUNT(*) FROM reinsert_knn) >= 1);
+INSERT INTO assert VALUES(
+  (SELECT COUNT(*) FROM reinsert_knn WHERE distance IS NULL OR distance < 0) = 0
+);
+
 SELECT 'delete_repair tests passed';

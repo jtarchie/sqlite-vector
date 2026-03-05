@@ -107,7 +107,7 @@ do
     check(errcode == SQLITE_CONSTRAINT, "sqlite3_errcode() == SQLITE_CONSTRAINT after bad dims")
 
     local errmsg = ffi.string(sq.sqlite3_errmsg(db))
-    check(errmsg:find("expected 4 dims") ~= nil, "error message mentions expected dims: " .. errmsg)
+    check(errmsg == "vec0: expected 4 dims, got 3", "wrong-dims INSERT error text exact: " .. errmsg)
 
     -- NULL vector: SQLITE_CONSTRAINT
     sq.sqlite3_prepare_v2(db, "INSERT INTO v(vector) VALUES(NULL)", -1, stmtp, nil)
@@ -121,6 +121,38 @@ do
     rc = sq.sqlite3_step(stmtp[0])
     sq.sqlite3_finalize(stmtp[0])
     check(rc == SQLITE_DONE, "DELETE returns SQLITE_DONE on success (rc=" .. rc .. ")")
+
+    close_db(db)
+end
+
+print(
+    "── FFI: constructor and LIMIT bounds ───────────────────────────────────")
+do
+    local db = open_db()
+    local stmtp = ffi.new("sqlite3_stmt*[1]")
+
+    local function assert_prepare_step_error(sql, expected_substr, label, expected_rc)
+        expected_rc = expected_rc or SQLITE_ERROR
+        local rc = sq.sqlite3_prepare_v2(db, sql, -1, stmtp, nil)
+        check(rc == SQLITE_OK, label .. " prepares")
+        rc = sq.sqlite3_step(stmtp[0])
+        check(rc == expected_rc, label .. " returns expected rc " .. expected_rc .. " (got " .. rc .. ")")
+        sq.sqlite3_finalize(stmtp[0])
+        local msg = ffi.string(sq.sqlite3_errmsg(db))
+        check(msg:find(expected_substr, 1, true) ~= nil, label .. " error mentions '" .. expected_substr .. "': " .. msg)
+    end
+
+    assert_prepare_step_error("CREATE VIRTUAL TABLE bad0 USING vec0(dims=0, metric=l2)",
+        "dims=N is required and must be > 0", "dims=0 CREATE")
+
+    assert_prepare_step_error("CREATE VIRTUAL TABLE badbig USING vec0(dims=8193, metric=l2)", "dims must be <= 8192",
+        "dims>8192 CREATE")
+
+    exec(db, "CREATE VIRTUAL TABLE v USING vec0(dims=3, metric=l2)")
+    exec(db, "INSERT INTO v(vector) VALUES('[1.0,0.0,0.0]')")
+
+    assert_prepare_step_error("SELECT rowid FROM v WHERE v MATCH '[1.0,0.0,0.0]' LIMIT 5000", "LIMIT must be <= 4096",
+        "kNN LIMIT>4096", SQLITE_CONSTRAINT)
 
     close_db(db)
 end
@@ -234,21 +266,43 @@ do
     local db = open_db()
     local stmtp = ffi.new("sqlite3_stmt*[1]")
 
+    local function assert_sql_error(sql, expected_substr, label)
+        sq.sqlite3_prepare_v2(db, sql, -1, stmtp, nil)
+        local rc = sq.sqlite3_step(stmtp[0])
+        sq.sqlite3_finalize(stmtp[0])
+        check(rc == SQLITE_ERROR, label .. " returns SQLITE_ERROR")
+        local msg = ffi.string(sq.sqlite3_errmsg(db))
+        check(msg:find(expected_substr, 1, true) ~= nil, label .. " error mentions '" .. expected_substr .. "': " .. msg)
+    end
+
+    local function assert_sql_ok_text(sql, expected, label)
+        sq.sqlite3_prepare_v2(db, sql, -1, stmtp, nil)
+        local rc = sq.sqlite3_step(stmtp[0])
+        check(rc == sqlite.SQLITE_ROW, label .. " returns SQLITE_ROW")
+        local txt = ffi.string(sq.sqlite3_column_text(stmtp[0], 0))
+        check(txt == expected, label .. " result == " .. expected .. " (got " .. txt .. ")")
+        rc = sq.sqlite3_step(stmtp[0])
+        check(rc == SQLITE_DONE, label .. " returns exactly one row")
+        sq.sqlite3_finalize(stmtp[0])
+    end
+
     -- malformed vector literal should surface SQLITE_ERROR
-    sq.sqlite3_prepare_v2(db, "SELECT vec('[1,2')", -1, stmtp, nil)
-    local rc = sq.sqlite3_step(stmtp[0])
-    sq.sqlite3_finalize(stmtp[0])
-    check(rc == SQLITE_ERROR, "vec() malformed literal returns SQLITE_ERROR")
-    local msg = ffi.string(sq.sqlite3_errmsg(db))
-    check(msg:find("invalid") ~= nil or msg:find("vector") ~= nil,
-        "vec() malformed literal sets helpful error message: " .. msg)
+    assert_sql_error("SELECT vec('[1,2')", "unterminated vector", "vec() unterminated literal")
+    assert_sql_error("SELECT vec('[]')", "empty vector", "vec() empty vector")
+    assert_sql_error("SELECT vec('[,]')", "empty vector", "vec() empty element only")
+    assert_sql_error("SELECT vec('[1a]')", "invalid float value", "vec() invalid float token")
+
+    -- currently accepted edge forms (documented behavior)
+    assert_sql_ok_text("SELECT vec('[1,]')", "[1]", "vec() trailing comma")
+    assert_sql_ok_text("SELECT vec('[1,,3]')", "[1,3]", "vec() repeated comma")
+    assert_sql_ok_text("SELECT vec('[1,2,3]9')", "[1,2,3]", "vec() trailing garbage")
 
     -- distance mismatch should also be a SQL error
     sq.sqlite3_prepare_v2(db, "SELECT vec_distance_l2('[1,2,3]', '[1,2]')", -1, stmtp, nil)
-    rc = sq.sqlite3_step(stmtp[0])
+    local rc = sq.sqlite3_step(stmtp[0])
     sq.sqlite3_finalize(stmtp[0])
     check(rc == SQLITE_ERROR, "vec_distance_l2 dimension mismatch returns SQLITE_ERROR")
-    msg = ffi.string(sq.sqlite3_errmsg(db))
+    local msg = ffi.string(sq.sqlite3_errmsg(db))
     check(msg:find("dimension mismatch") ~= nil, "distance mismatch error message mentions dimensions: " .. msg)
 
     close_db(db)
@@ -282,6 +336,68 @@ do
 
     local msg = ffi.string(sq.sqlite3_errmsg(db))
     check(msg:find("cannot change rowid") ~= nil, "rowid-change UPDATE error mentions rowid immutability: " .. msg)
+
+    close_db(db)
+end
+
+print(
+    "── FFI: explain query plan index paths ──────────────────────────────────")
+do
+    local db = open_db()
+    exec(db, "CREATE VIRTUAL TABLE v USING vec0(dims=3, metric=l2)")
+    exec(db, "INSERT INTO v(vector) VALUES('[1.0,0.0,0.0]')")
+    exec(db, "INSERT INTO v(vector) VALUES('[0.0,1.0,0.0]')")
+    exec(db, "INSERT INTO v(vector) VALUES('[0.0,0.0,1.0]')")
+
+    local function plan_detail(sql)
+        local detail = ""
+        query(db, "EXPLAIN QUERY PLAN " .. sql, function(stmt)
+            detail = ffi.string(sq.sqlite3_column_text(stmt, 3))
+        end)
+        return detail
+    end
+
+    local d_match = plan_detail("SELECT rowid FROM v WHERE v MATCH '[1,0,0]' LIMIT 2")
+    check(d_match:find("VIRTUAL TABLE INDEX 8193", 1, true) ~= nil,
+        "MATCH path uses virtual index 8193 (idx=1|LIMIT): " .. d_match)
+
+    local d_rowid = plan_detail("SELECT rowid FROM v WHERE rowid=2")
+    check(d_rowid:find("VIRTUAL TABLE INDEX 2", 1, true) ~= nil, "rowid lookup uses virtual index 2: " .. d_rowid)
+
+    local d_full = plan_detail("SELECT rowid FROM v")
+    check(d_full:find("VIRTUAL TABLE INDEX 0", 1, true) ~= nil, "full scan uses virtual index 0: " .. d_full)
+
+    local op_cases = {{
+        sql = "SELECT rowid FROM v WHERE vec_distance_l2(v,'[1,0,0]') LIMIT 2",
+        idx = 8343,
+        name = "l2"
+    }, {
+        sql = "SELECT rowid FROM v WHERE vec_distance_cosine(v,'[1,0,0]') LIMIT 2",
+        idx = 8344,
+        name = "cosine"
+    }, {
+        sql = "SELECT rowid FROM v WHERE vec_distance_ip(v,'[1,0,0]') LIMIT 2",
+        idx = 8345,
+        name = "ip"
+    }, {
+        sql = "SELECT rowid FROM v WHERE vec_distance_l1(v,'[1,0,0]') LIMIT 2",
+        idx = 8346,
+        name = "l1"
+    }, {
+        sql = "SELECT rowid FROM v WHERE vec_distance_hamming(v,'[1,0,0]') LIMIT 2",
+        idx = 8347,
+        name = "hamming"
+    }, {
+        sql = "SELECT rowid FROM v WHERE vec_distance_jaccard(v,'[1,0,0]') LIMIT 2",
+        idx = 8348,
+        name = "jaccard"
+    }}
+
+    for _, c in ipairs(op_cases) do
+        local d = plan_detail(c.sql)
+        check(d:find("VIRTUAL TABLE INDEX " .. tostring(c.idx), 1, true) ~= nil,
+            "operator path " .. c.name .. " uses virtual index " .. tostring(c.idx) .. ": " .. d)
+    end
 
     close_db(db)
 end

@@ -10,6 +10,11 @@
 
 SQLITE_EXTENSION_INIT3
 
+#define VEC0_MAX_DIMS 8192
+#define VEC0_MAX_LIMIT 4096
+#define VEC0_IDX_FLAG_EF 0x1000
+#define VEC0_IDX_FLAG_LIMIT 0x2000
+
 /* ── Internal structs ────────────────────────────────────────────────────────
  */
 
@@ -82,12 +87,7 @@ static int parse_arg(const char *arg, const char *key, char **out_val) {
   return 0;
 }
 
-static void vec0_free(Vec0Table *p) {
-  if (!p)
-    return;
-  sqlite3_free(p->name);
-  sqlite3_free(p->schema);
-  sqlite3_free(p->metric);
+static void vec0_finalize_stmts(Vec0Table *p) {
   sqlite3_finalize(p->sc_get_nbrs);
   sqlite3_finalize(p->sc_get_vec);
   sqlite3_finalize(p->sc_scan_ids);
@@ -97,6 +97,24 @@ static void vec0_free(Vec0Table *p) {
   sqlite3_finalize(p->sc_ins_layer);
   sqlite3_finalize(p->sc_nbr_count);
   sqlite3_finalize(p->sc_rev_nbrs);
+  p->sc_get_nbrs = NULL;
+  p->sc_get_vec = NULL;
+  p->sc_scan_ids = NULL;
+  p->sc_lookup_id = NULL;
+  p->sc_ins_edge = NULL;
+  p->sc_del_edges = NULL;
+  p->sc_ins_layer = NULL;
+  p->sc_nbr_count = NULL;
+  p->sc_rev_nbrs = NULL;
+}
+
+static void vec0_free(Vec0Table *p) {
+  if (!p)
+    return;
+  sqlite3_free(p->name);
+  sqlite3_free(p->schema);
+  sqlite3_free(p->metric);
+  vec0_finalize_stmts(p);
   sqlite3_free(p);
 }
 
@@ -358,6 +376,11 @@ static int vec0Init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
       vec0_free(p);
       return SQLITE_ERROR;
     }
+    if (p->dims > VEC0_MAX_DIMS) {
+      *pzErr = sqlite3_mprintf("vec0: dims must be <= %d", VEC0_MAX_DIMS);
+      vec0_free(p);
+      return SQLITE_ERROR;
+    }
 
     int rc = vec0_create_shadow(p, pzErr);
     if (rc != SQLITE_OK) {
@@ -371,6 +394,13 @@ static int vec0Init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
       vec0_free(p);
       return rc;
     }
+  }
+
+  if (p->dims <= 0 || p->dims > VEC0_MAX_DIMS) {
+    *pzErr = sqlite3_mprintf("vec0: invalid dims %d (must be 1..%d)", p->dims,
+                             VEC0_MAX_DIMS);
+    vec0_free(p);
+    return SQLITE_ERROR;
   }
 
   /* Resolve distance kernel from metric string */
@@ -487,21 +517,31 @@ static void op_dist_fn(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
   (void)pVtab;
 
-/* Helper: look for an EQ constraint on col 3 (ef_search HIDDEN) and, if
- * found, assign it argvIndex 2 so xFilter receives it as argv[1]. */
-#define ASSIGN_EF_SEARCH_ARG()                                                 \
-  do {                                                                         \
-    for (int _j = 0; _j < pInfo->nConstraint; _j++) {                          \
-      if (!pInfo->aConstraint[_j].usable)                                      \
-        continue;                                                              \
-      if (pInfo->aConstraint[_j].iColumn == 3 &&                               \
-          pInfo->aConstraint[_j].op == SQLITE_INDEX_CONSTRAINT_EQ) {           \
-        pInfo->aConstraintUsage[_j].argvIndex = 2;                             \
-        pInfo->aConstraintUsage[_j].omit = 1;                                  \
-        break;                                                                 \
-      }                                                                        \
-    }                                                                          \
-  } while (0)
+  /* Helpers: optional ef_search hidden-column EQ and LIMIT constraints.
+   * If present on a kNN plan, they are passed to xFilter as extra argv. */
+  int flags = 0;
+  int nextArg = 2;
+  for (int j = 0; j < pInfo->nConstraint; j++) {
+    if (!pInfo->aConstraint[j].usable)
+      continue;
+    if (pInfo->aConstraint[j].iColumn == 3 &&
+        pInfo->aConstraint[j].op == SQLITE_INDEX_CONSTRAINT_EQ) {
+      pInfo->aConstraintUsage[j].argvIndex = nextArg++;
+      pInfo->aConstraintUsage[j].omit = 1;
+      flags |= VEC0_IDX_FLAG_EF;
+      break;
+    }
+  }
+  for (int j = 0; j < pInfo->nConstraint; j++) {
+    if (!pInfo->aConstraint[j].usable)
+      continue;
+    if (pInfo->aConstraint[j].op == SQLITE_INDEX_CONSTRAINT_LIMIT) {
+      pInfo->aConstraintUsage[j].argvIndex = nextArg++;
+      pInfo->aConstraintUsage[j].omit = 1;
+      flags |= VEC0_IDX_FLAG_LIMIT;
+      break;
+    }
+  }
 
   /* 0. Operator-alias kNN constraints (op 151-156, set by xFindFunction). */
   for (int i = 0; i < pInfo->nConstraint; i++) {
@@ -511,8 +551,8 @@ static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     if (op >= 151 && op <= 156) {
       pInfo->aConstraintUsage[i].argvIndex = 1;
       pInfo->aConstraintUsage[i].omit = 1;
-      ASSIGN_EF_SEARCH_ARG();
       pInfo->idxNum =
+          flags |
           op; /* 151=l2 152=cosine 153=ip 154=l1 155=hamming 156=jaccard */
       pInfo->estimatedCost = 10.0;
       pInfo->estimatedRows = 10;
@@ -530,8 +570,7 @@ static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
       pInfo->aConstraintUsage[i].argvIndex =
           1; /* query vector → xFilter argv[0] */
       pInfo->aConstraintUsage[i].omit = 1;
-      ASSIGN_EF_SEARCH_ARG();
-      pInfo->idxNum = 1; /* kNN path */
+      pInfo->idxNum = flags | 1; /* kNN path */
       pInfo->estimatedCost = 10.0;
       pInfo->estimatedRows = 10;
       return SQLITE_OK;
@@ -689,19 +728,42 @@ static int vec0_filter_knn(Vec0Cursor *cur, int idxNum, int argc,
     return SQLITE_ERROR;
   }
 
+  int has_ef_arg = (idxNum & VEC0_IDX_FLAG_EF) != 0;
+  int has_limit_arg = (idxNum & VEC0_IDX_FLAG_LIMIT) != 0;
+  int base_idxnum = idxNum & ~(VEC0_IDX_FLAG_EF | VEC0_IDX_FLAG_LIMIT);
+
   int ef = p->ef_search;
-  if (argc >= 2 && sqlite3_value_type(argv[1]) == SQLITE_INTEGER) {
-    int v = sqlite3_value_int(argv[1]);
-    if (v > 0)
-      ef = v;
+  int argi = 1;
+  if (has_ef_arg && argi < argc) {
+    if (sqlite3_value_type(argv[argi]) == SQLITE_INTEGER) {
+      int v = sqlite3_value_int(argv[argi]);
+      if (v > 0)
+        ef = v;
+    }
+    argi++;
   }
+
   int k = ef;
+  if (has_limit_arg && argi < argc) {
+    if (sqlite3_value_type(argv[argi]) == SQLITE_INTEGER) {
+      int lim = sqlite3_value_int(argv[argi]);
+      if (lim > VEC0_MAX_LIMIT) {
+        sqlite3_free(query_vec);
+        cur->base.pVtab->zErrMsg =
+            sqlite3_mprintf("vec0: LIMIT must be <= %d", VEC0_MAX_LIMIT);
+        return SQLITE_CONSTRAINT;
+      }
+      if (lim > 0)
+        k = lim;
+    }
+    argi++;
+  }
 
   dist_fn_t knn_dist_fn = p->dist_fn;
-  if (idxNum >= 151 && idxNum <= 156) {
+  if (base_idxnum >= 151 && base_idxnum <= 156) {
     static const char *op_metrics[] = {"l2", "cosine",  "ip",
                                        "l1", "hamming", "jaccard"};
-    dist_fn_t override = distance_for_metric(op_metrics[idxNum - 151]);
+    dist_fn_t override = distance_for_metric(op_metrics[base_idxnum - 151]);
     if (override)
       knn_dist_fn = override;
   }
@@ -750,15 +812,16 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   (void)argv;
 
   Vec0Cursor *cur = (Vec0Cursor *)pCursor;
+  int base_idxnum = idxNum & ~(VEC0_IDX_FLAG_EF | VEC0_IDX_FLAG_LIMIT);
   vec0_cursor_clear_results(cur);
 
-  if (idxNum == 0)
+  if (base_idxnum == 0)
     return vec0_filter_fullscan(cur);
 
-  if (idxNum == 2)
+  if (base_idxnum == 2)
     return vec0_filter_rowid_eq(cur, argc, argv);
 
-  if (idxNum != 1 && (idxNum < 151 || idxNum > 156))
+  if (base_idxnum != 1 && (base_idxnum < 151 || base_idxnum > 156))
     return SQLITE_OK;
 
   return vec0_filter_knn(cur, idxNum, argc, argv);
@@ -1233,6 +1296,48 @@ static int vec0Rollback(sqlite3_vtab *pVtab) {
   return SQLITE_OK;
 }
 
+static int vec0Rename(sqlite3_vtab *pVtab, const char *zNew) {
+  Vec0Table *p = (Vec0Table *)pVtab;
+  static const char *shadows[] = {"config", "data", "graph", "layers"};
+
+  if (!zNew || !*zNew) {
+    pVtab->zErrMsg = sqlite3_mprintf("vec0: invalid new table name");
+    return SQLITE_ERROR;
+  }
+
+  for (int i = 0; i < 4; i++) {
+    char *sql =
+        sqlite3_mprintf("ALTER TABLE \"%w\".\"%w_%w\" RENAME TO \"%w_%w\"",
+                        p->schema, p->name, shadows[i], zNew, shadows[i]);
+    int rc = sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK) {
+      pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+      return rc;
+    }
+  }
+
+  sqlite3_free(p->name);
+  p->name = sqlite3_mprintf("%s", zNew);
+  if (!p->name) {
+    pVtab->zErrMsg = sqlite3_mprintf("vec0: out of memory");
+    return SQLITE_NOMEM;
+  }
+
+  vec0_finalize_stmts(p);
+  {
+    char *prep_err = NULL;
+    int rc = vec0_prepare_stmts(p, &prep_err);
+    if (rc != SQLITE_OK) {
+      pVtab->zErrMsg =
+          prep_err ? prep_err : sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+      return rc;
+    }
+  }
+
+  return SQLITE_OK;
+}
+
 /* ── Module definition ───────────────────────────────────────────────────────
  */
 
@@ -1256,7 +1361,7 @@ sqlite3_module vec0Module = {
     /* xCommit     */ vec0Commit,
     /* xRollback   */ vec0Rollback,
     /* xFindFunction */ vec0FindFunction,
-    /* xRename     */ NULL,
+    /* xRename     */ vec0Rename,
     /* xSavepoint  */ NULL,
     /* xRelease    */ NULL,
     /* xRollbackTo */ NULL,

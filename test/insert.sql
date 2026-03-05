@@ -45,10 +45,8 @@ INSERT INTO assert VALUES(
 );
 
 -- ── Dimension mismatch is enforced in xUpdate (SQLITE_CONSTRAINT) ─────────
--- Verified manually: inserting a wrong-dims vector returns
--- "vec0: expected N dims, got M" and leaves items_data unchanged.
--- A separate shell-level test could assert exit code != 0; here we
--- confirm count is still 3 to catch any accidental silent acceptance.
+-- Exact errmsg text is asserted in test/ffi_test.lua where sqlite3_errmsg()
+-- is available. Here we verify state remains unchanged.
 INSERT INTO assert VALUES(
   (SELECT value FROM items_config WHERE key='count') = '3'
 );
