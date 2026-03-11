@@ -131,6 +131,84 @@ rowid | distance
 3     | 1.0
 ```
 
+## Simple Wikipedia Semantic Search
+
+This repository now includes Ruby scripts to build an embedded semantic search
+database from the Simple English Wikipedia dump using Ollama model
+`embeddinggemma` and sqlite-vector.
+
+### Prerequisites
+
+1. Build the extension:
+
+```bash
+xmake
+```
+
+2. Install Ruby dependencies:
+
+```bash
+bundle install
+```
+
+3. Start Ollama and ensure the embedding model is available:
+
+```bash
+ollama pull embeddinggemma
+ollama serve
+```
+
+### 1) Ingest Wikipedia and Build Vectors
+
+Run the ingest script (default indexes a subset first: 10,000 articles):
+
+```bash
+bundle exec ruby scripts/wiki_ingest.rb
+```
+
+Useful flags:
+
+```bash
+bundle exec ruby scripts/wiki_ingest.rb \
+  --max-articles 20000 \
+  --db-path data/wiki_simple.db \
+  --chunk-max-chars 1200 \
+  --batch-size 100
+```
+
+For full-dump indexing:
+
+```bash
+bundle exec ruby scripts/wiki_ingest.rb --max-articles 0
+```
+
+### 2) Query by Semantic Similarity
+
+Search and show article title plus matched content segment:
+
+```bash
+bundle exec ruby scripts/wiki_query.rb "how does photosynthesis work"
+```
+
+Tune top-k and HNSW query width:
+
+```bash
+bundle exec ruby scripts/wiki_query.rb "history of london" --k 8 --ef-search 120
+```
+
+### Script Outputs
+
+- `scripts/wiki_ingest.rb`:
+  - Downloads `simplewiki-latest-pages-articles.xml.bz2`
+  - Parses articles
+  - Chunks article content by paragraphs
+  - Embeds chunks with Ollama `embeddinggemma`
+  - Stores metadata in relational tables and vectors in a `vec0` table
+- `scripts/wiki_query.rb`:
+  - Embeds query text
+  - Runs `MATCH` KNN search in sqlite-vector
+  - Joins to article/chunk metadata and prints ranked results
+
 ## Creating Tables
 
 Create a virtual table with the `vec0` module:

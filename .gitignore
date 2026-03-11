@@ -6,3 +6,4 @@ build/
 
 # Benchmark outputs (generated)
 bench/results/
+data/
