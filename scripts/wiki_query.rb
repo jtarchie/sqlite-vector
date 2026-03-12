@@ -142,8 +142,8 @@ def main
     preview = truncate_text(row['content'], options[:preview_chars])
 
     puts
-    puts format('%d. %s (chunk %s, distance=%.6f)', idx + 1, title, chunk_index, distance)
-    puts preview
+    puts format('%d. %s (chunk %d, distance=%.4f)', idx + 1, title, chunk_index, distance)
+    puts "   #{preview}"
   end
 
   0
