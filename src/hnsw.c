@@ -787,6 +787,16 @@ int hnsw_delete(HnswCtx *ctx, sqlite3_int64 rowid) {
                         ctx->ef_construction, lc, stmt_get_nbrs, stmt_get_vec,
                         &W);
 
+      /* Remove N itself from the candidate set to avoid self-edges */
+      if (rc == SQLITE_OK) {
+        int dst = 0;
+        for (int j = 0; j < W.len; j++) {
+          if (W.data[j].id != nid)
+            W.data[dst++] = W.data[j];
+        }
+        W.len = dst;
+      }
+
       if (rc == SQLITE_OK && W.len > 0) {
         int Mmax = (lc == 0) ? ctx->m * 2 : ctx->m;
 
@@ -798,12 +808,40 @@ int hnsw_delete(HnswCtx *ctx, sqlite3_int64 rowid) {
         if (rc == SQLITE_OK) {
           int nconn = W.len < Mmax ? W.len : Mmax;
           for (int j = 0; j < nconn; j++) {
+            sqlite3_int64 nbr_id = W.data[j].id;
             sqlite3_reset(stmt_ins_edge);
             sqlite3_bind_int(stmt_ins_edge, 1, lc);
-            sqlite3_bind_int64(stmt_ins_edge, 2, W.data[j].id);
+            sqlite3_bind_int64(stmt_ins_edge, 2, nbr_id);
             sqlite3_bind_int64(stmt_ins_edge, 3, nid);
             sqlite3_bind_double(stmt_ins_edge, 4, W.data[j].dist);
             sqlite3_step(stmt_ins_edge);
+
+            /* Prune if neighbor now exceeds Mmax edges */
+            sqlite3_reset(ctx->sc_nbr_count);
+            sqlite3_bind_int(ctx->sc_nbr_count, 1, lc);
+            sqlite3_bind_int64(ctx->sc_nbr_count, 2, nbr_id);
+            int nbr_conn = 0;
+            if (sqlite3_step(ctx->sc_nbr_count) == SQLITE_ROW)
+              nbr_conn = sqlite3_column_int(ctx->sc_nbr_count, 0);
+
+            if (nbr_conn > Mmax) {
+              sqlite3_reset(stmt_get_nbrs);
+              sqlite3_bind_int(stmt_get_nbrs, 1, lc);
+              sqlite3_bind_int64(stmt_get_nbrs, 2, nbr_id);
+
+              Heap nbr_W;
+              heap_init(&nbr_W);
+              while (sqlite3_step(stmt_get_nbrs) == SQLITE_ROW) {
+                sqlite3_int64 n2 = sqlite3_column_int64(stmt_get_nbrs, 0);
+                double nd = sqlite3_column_double(stmt_get_nbrs, 1);
+                maxheap_push(&nbr_W, n2, nd);
+              }
+              sqlite3_reset(stmt_get_nbrs);
+
+              set_connections(ctx, lc, nbr_id, &nbr_W, Mmax, stmt_ins_edge,
+                              stmt_del_edges);
+              heap_free(&nbr_W);
+            }
           }
         }
       }

@@ -23,11 +23,17 @@
 SQLITE_EXTENSION_INIT3
 
 /* -------------------------------------------------------------------------- */
-/* vec_add: element-wise sum */
+/* vec_add / vec_sub: element-wise binary vector operations                   */
 /* -------------------------------------------------------------------------- */
 
-static void sql_vec_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+typedef enum { VEC_BINOP_ADD, VEC_BINOP_SUB } VecBinOp;
+
+/* Shared implementation for vec_add and vec_sub.  The only difference is
+ * the per-element operator applied in the inner loop. */
+static void sql_vec_binop(sqlite3_context *ctx, int argc, sqlite3_value **argv,
+                          VecBinOp op) {
   (void)argc;
+  const char *op_name = (op == VEC_BINOP_ADD) ? "vec_add" : "vec_sub";
 
   if (sqlite3_value_type(argv[0]) == SQLITE_NULL ||
       sqlite3_value_type(argv[1]) == SQLITE_NULL) {
@@ -43,20 +49,28 @@ static void sql_vec_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   char *err = NULL;
 
   if (vec_parse(text_a, &va, &dims_a, &err) != SQLITE_OK) {
-    sqlite3_result_error(ctx, err ? err : "vec_add: invalid first vector", -1);
+    char *msg = sqlite3_mprintf("%s: invalid first vector: %s", op_name,
+                                err ? err : "parse error");
+    sqlite3_result_error(ctx, msg, -1);
+    sqlite3_free(msg);
     sqlite3_free(err);
     return;
   }
   if (vec_parse(text_b, &vb, &dims_b, &err) != SQLITE_OK) {
     sqlite3_free(va);
-    sqlite3_result_error(ctx, err ? err : "vec_add: invalid second vector", -1);
+    char *msg = sqlite3_mprintf("%s: invalid second vector: %s", op_name,
+                                err ? err : "parse error");
+    sqlite3_result_error(ctx, msg, -1);
+    sqlite3_free(msg);
     sqlite3_free(err);
     return;
   }
   if (dims_a != dims_b) {
     sqlite3_free(va);
     sqlite3_free(vb);
-    sqlite3_result_error(ctx, "vec_add: dimension mismatch", -1);
+    char *msg = sqlite3_mprintf("%s: dimension mismatch", op_name);
+    sqlite3_result_error(ctx, msg, -1);
+    sqlite3_free(msg);
     return;
   }
 
@@ -68,8 +82,12 @@ static void sql_vec_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     return;
   }
 
-  for (int i = 0; i < dims_a; i++) {
-    result[i] = va[i] + vb[i];
+  if (op == VEC_BINOP_ADD) {
+    for (int i = 0; i < dims_a; i++)
+      result[i] = va[i] + vb[i];
+  } else {
+    for (int i = 0; i < dims_a; i++)
+      result[i] = va[i] - vb[i];
   }
 
   char *result_text = vec_format(result, dims_a);
@@ -85,67 +103,12 @@ static void sql_vec_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   sqlite3_result_text(ctx, result_text, -1, sqlite3_free);
 }
 
-/* -------------------------------------------------------------------------- */
-/* vec_sub: element-wise difference */
-/* -------------------------------------------------------------------------- */
+static void sql_vec_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  sql_vec_binop(ctx, argc, argv, VEC_BINOP_ADD);
+}
 
 static void sql_vec_sub(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  (void)argc;
-
-  if (sqlite3_value_type(argv[0]) == SQLITE_NULL ||
-      sqlite3_value_type(argv[1]) == SQLITE_NULL) {
-    sqlite3_result_null(ctx);
-    return;
-  }
-
-  const char *text_a = (const char *)sqlite3_value_text(argv[0]);
-  const char *text_b = (const char *)sqlite3_value_text(argv[1]);
-
-  float *va = NULL, *vb = NULL;
-  int dims_a = 0, dims_b = 0;
-  char *err = NULL;
-
-  if (vec_parse(text_a, &va, &dims_a, &err) != SQLITE_OK) {
-    sqlite3_result_error(ctx, err ? err : "vec_sub: invalid first vector", -1);
-    sqlite3_free(err);
-    return;
-  }
-  if (vec_parse(text_b, &vb, &dims_b, &err) != SQLITE_OK) {
-    sqlite3_free(va);
-    sqlite3_result_error(ctx, err ? err : "vec_sub: invalid second vector", -1);
-    sqlite3_free(err);
-    return;
-  }
-  if (dims_a != dims_b) {
-    sqlite3_free(va);
-    sqlite3_free(vb);
-    sqlite3_result_error(ctx, "vec_sub: dimension mismatch", -1);
-    return;
-  }
-
-  float *result = sqlite3_malloc64(dims_a * sizeof(float));
-  if (!result) {
-    sqlite3_free(va);
-    sqlite3_free(vb);
-    sqlite3_result_error_nomem(ctx);
-    return;
-  }
-
-  for (int i = 0; i < dims_a; i++) {
-    result[i] = va[i] - vb[i];
-  }
-
-  char *result_text = vec_format(result, dims_a);
-  sqlite3_free(va);
-  sqlite3_free(vb);
-  sqlite3_free(result);
-
-  if (!result_text) {
-    sqlite3_result_error_nomem(ctx);
-    return;
-  }
-
-  sqlite3_result_text(ctx, result_text, -1, sqlite3_free);
+  sql_vec_binop(ctx, argc, argv, VEC_BINOP_SUB);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -270,6 +233,10 @@ static void sql_vec_slice(sqlite3_context *ctx, int argc,
 /* Typed vector constructors: vec_f32, vec_int8, vec_bit, vec_type */
 /* -------------------------------------------------------------------------- */
 
+/* Subtype tags used by SQLite's sqlite3_result_subtype() /
+ * sqlite3_value_subtype(). Values 223-225 are in the "application" range (>=
+ * 77) and are arbitrary but fixed — changing them would break interop with any
+ * code checking subtypes. */
 #define VEC_SUBTYPE_F32 223
 #define VEC_SUBTYPE_BIT 224
 #define VEC_SUBTYPE_INT8 225

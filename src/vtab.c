@@ -10,14 +10,43 @@
 
 SQLITE_EXTENSION_INIT3
 
+/* Maximum vector dimensionality.  8192 × 4 = 32 KiB per float32 vector,
+ * which fits comfortably in a single SQLite page at any page_size ≥ 64 KiB
+ * and keeps per-row allocations reasonable. */
 #define VEC0_MAX_DIMS 8192
+
+/* Maximum value accepted in a LIMIT clause on a kNN query.
+ * Caps the result-set memory to 4096 × 16 bytes = 64 KiB per cursor. */
 #define VEC0_MAX_LIMIT 4096
-#define VEC0_IDX_FLAG_EF 0x1000
-#define VEC0_IDX_FLAG_LIMIT 0x2000
-#define VEC0_IDX_FLAG_DIST_LT 0x4000
-#define VEC0_IDX_FLAG_DIST_LE 0x8000
-#define VEC0_IDX_FLAG_DIST_GT 0x10000
-#define VEC0_IDX_FLAG_DIST_GE 0x20000
+
+/* ── Operator codes returned by xFindFunction ────────────────────────────
+ * When vec_distance_*() is called on a virtual-table column, xFindFunction
+ * returns one of these codes.  SQLite stores the value as aConstraint[i].op
+ * and xBestIndex reads it to determine which distance function the query
+ * requested.  The base values encode the metric; higher flag bits are OR'd
+ * in to signal optional per-query constraints (ef_search, LIMIT, distance
+ * thresholds). */
+#define VEC0_OP_DISTANCE_L2 151      /* vec_distance_l2      <-> */
+#define VEC0_OP_DISTANCE_COSINE 152  /* vec_distance_cosine  <=> */
+#define VEC0_OP_DISTANCE_IP 153      /* vec_distance_ip      <#> */
+#define VEC0_OP_DISTANCE_L1 154      /* vec_distance_l1      <+> */
+#define VEC0_OP_DISTANCE_HAMMING 155 /* vec_distance_hamming <~> */
+#define VEC0_OP_DISTANCE_JACCARD 156 /* vec_distance_jaccard <%> */
+
+/* ── idxNum flag bits ────────────────────────────────────────────────────
+ * OR'd onto the base idxNum (1=MATCH, 2=rowid-eq, 151-156=operator) to
+ * signal which optional constraints are present in argv[]. */
+#define VEC0_IDX_FLAG_EF 0x1000       /* ef_search override in argv */
+#define VEC0_IDX_FLAG_LIMIT 0x2000    /* explicit LIMIT in argv */
+#define VEC0_IDX_FLAG_DIST_LT 0x4000  /* distance < threshold */
+#define VEC0_IDX_FLAG_DIST_LE 0x8000  /* distance <= threshold */
+#define VEC0_IDX_FLAG_DIST_GT 0x10000 /* distance > threshold */
+#define VEC0_IDX_FLAG_DIST_GE 0x20000 /* distance >= threshold */
+
+/* Mask to strip all flag bits and recover the base idxNum. */
+#define VEC0_IDX_BASE_MASK                                                     \
+  ~(VEC0_IDX_FLAG_EF | VEC0_IDX_FLAG_LIMIT | VEC0_IDX_FLAG_DIST_LT |           \
+    VEC0_IDX_FLAG_DIST_LE | VEC0_IDX_FLAG_DIST_GT | VEC0_IDX_FLAG_DIST_GE)
 
 /* ── Internal structs ────────────────────────────────────────────────────────
  */
@@ -111,7 +140,13 @@ static int parse_arg(const char *arg, const char *key, char **out_val) {
 /* Convert float vector to the native storage type.
  * Returns a newly allocated blob (caller must sqlite3_free) and sets *out_bytes
  * to the blob size.  For VEC_STORAGE_F32, returns NULL (caller should use the
- * float array directly). */
+ * float array directly).
+ *
+ * INT8 clamping: values outside [-128, 127] are clamped to the range boundary
+ * with rounding (±0.5) so that e.g. 127.3 → 127, -128.7 → -128.
+ *
+ * BIT packing: each float > 0 becomes a 1-bit; MSB-first within each byte.
+ * Formula: byte_count = (dims + 7) / 8  (ceiling division by 8). */
 static void *vec_convert_to_storage(const float *fvec, int dims,
                                     int storage_type, int *out_bytes) {
   if (storage_type == VEC_STORAGE_INT8) {
@@ -196,7 +231,12 @@ static void vec0_free(Vec0Table *p) {
 }
 
 /* Prepare shared statements and store them on the Vec0Table.
- * Called from vec0Init after name/schema are set and shadow tables exist. */
+ * Called from vec0Init after name/schema are set and shadow tables exist.
+ *
+ * The PREP() macro below formats SQL via sqlite3_mprintf, compiles it with
+ * sqlite3_prepare_v2, and stores the result on the Vec0Table field.  On any
+ * failure it sets *pzErr and returns immediately — the caller (vec0Init) is
+ * responsible for calling vec0_free() which finalizes all non-NULL stmts. */
 static int vec0_prepare_stmts(Vec0Table *p, char **pzErr) {
   char *sql;
   int rc;
@@ -612,6 +652,9 @@ static int vec0Disconnect(sqlite3_vtab *pVtab) {
 static int vec0Destroy(sqlite3_vtab *pVtab) {
   Vec0Table *p = (Vec0Table *)pVtab;
   static const char *shadows[] = {"config", "data", "graph", "layers"};
+  /* Finalize prepared statements before dropping the shadow tables they
+   * reference — SQLite cannot drop tables with outstanding statements. */
+  vec0_finalize_stmts(p);
   for (int i = 0; i < 4; i++) {
     char *sql = sqlite3_mprintf("DROP TABLE IF EXISTS \"%w\".\"%w_%w\"",
                                 p->schema, p->name, shadows[i]);
@@ -754,12 +797,10 @@ static int vec0BestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     if (!pInfo->aConstraint[i].usable)
       continue;
     int op = pInfo->aConstraint[i].op;
-    if (op >= 151 && op <= 156) {
+    if (op >= VEC0_OP_DISTANCE_L2 && op <= VEC0_OP_DISTANCE_JACCARD) {
       pInfo->aConstraintUsage[i].argvIndex = 1;
       pInfo->aConstraintUsage[i].omit = 1;
-      pInfo->idxNum =
-          flags |
-          op; /* 151=l2 152=cosine 153=ip 154=l1 155=hamming 156=jaccard */
+      pInfo->idxNum = flags | op;
       pInfo->estimatedCost = 10.0;
       pInfo->estimatedRows = 10;
       return SQLITE_OK;
@@ -940,9 +981,7 @@ static int vec0_filter_knn(Vec0Cursor *cur, int idxNum, int argc,
   int has_dist_le = (idxNum & VEC0_IDX_FLAG_DIST_LE) != 0;
   int has_dist_gt = (idxNum & VEC0_IDX_FLAG_DIST_GT) != 0;
   int has_dist_ge = (idxNum & VEC0_IDX_FLAG_DIST_GE) != 0;
-  int base_idxnum = idxNum & ~(VEC0_IDX_FLAG_EF | VEC0_IDX_FLAG_LIMIT |
-                               VEC0_IDX_FLAG_DIST_LT | VEC0_IDX_FLAG_DIST_LE |
-                               VEC0_IDX_FLAG_DIST_GT | VEC0_IDX_FLAG_DIST_GE);
+  int base_idxnum = idxNum & VEC0_IDX_BASE_MASK;
 
   int ef = p->ef_search;
   int argi = 1;
@@ -988,11 +1027,12 @@ static int vec0_filter_knn(Vec0Cursor *cur, int idxNum, int argc,
   }
 
   dist_fn_t knn_dist_fn = p->dist_fn;
-  if (base_idxnum >= 151 && base_idxnum <= 156) {
+  if (base_idxnum >= VEC0_OP_DISTANCE_L2 &&
+      base_idxnum <= VEC0_OP_DISTANCE_JACCARD) {
     static const char *op_metrics[] = {"l2", "cosine",  "ip",
                                        "l1", "hamming", "jaccard"};
     dist_fn_t override = distance_for_metric_typed(
-        op_metrics[base_idxnum - 151], p->storage_type);
+        op_metrics[base_idxnum - VEC0_OP_DISTANCE_L2], p->storage_type);
     if (override)
       knn_dist_fn = override;
   }
@@ -1063,9 +1103,7 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   (void)argv;
 
   Vec0Cursor *cur = (Vec0Cursor *)pCursor;
-  int base_idxnum = idxNum & ~(VEC0_IDX_FLAG_EF | VEC0_IDX_FLAG_LIMIT |
-                               VEC0_IDX_FLAG_DIST_LT | VEC0_IDX_FLAG_DIST_LE |
-                               VEC0_IDX_FLAG_DIST_GT | VEC0_IDX_FLAG_DIST_GE);
+  int base_idxnum = idxNum & VEC0_IDX_BASE_MASK;
   vec0_cursor_clear_results(cur);
 
   if (base_idxnum == 0)
@@ -1074,7 +1112,8 @@ static int vec0Filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   if (base_idxnum == 2)
     return vec0_filter_rowid_eq(cur, argc, argv);
 
-  if (base_idxnum != 1 && (base_idxnum < 151 || base_idxnum > 156))
+  if (base_idxnum != 1 && (base_idxnum < VEC0_OP_DISTANCE_L2 ||
+                           base_idxnum > VEC0_OP_DISTANCE_JACCARD))
     return SQLITE_OK;
 
   return vec0_filter_knn(cur, idxNum, argc, argv);
@@ -1431,13 +1470,9 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 /* ── xFindFunction ───────────────────────────────────────────────────────────
  * Intercept vec_distance_* calls on a vtab column so SQLite routes them
  * through xBestIndex as index-accelerated kNN scans.
- * Returns a nonzero code that becomes aConstraint[i].op in xBestIndex.
- *   151 = vec_distance_l2      (L2 / Euclidean)       <->
- *   152 = vec_distance_cosine  (cosine distance)       <=>
- *   153 = vec_distance_ip      (inner product)         <#>
- *   154 = vec_distance_l1      (L1 / Manhattan)        <+>
- *   155 = vec_distance_hamming (Hamming, binary vecs)  <~>
- *   156 = vec_distance_jaccard (Jaccard, binary vecs)  <%>
+ * Returns a nonzero operator code (VEC0_OP_DISTANCE_*) that becomes
+ * aConstraint[i].op in xBestIndex.  See the constant definitions near the
+ * top of this file for the mapping.
  *
  * When used on regular (non-vtab) columns the pre-registered scalars in
  * distance.c handle the call normally — xFindFunction is never invoked.
@@ -1452,32 +1487,32 @@ static int vec0FindFunction(sqlite3_vtab *pVtab, int nArg, const char *zName,
   if (strcmp(zName, "vec_distance_l2") == 0) {
     *pxFunc = op_dist_fn;
     *ppArg = (void *)"l2";
-    return 151;
+    return VEC0_OP_DISTANCE_L2;
   }
   if (strcmp(zName, "vec_distance_cosine") == 0) {
     *pxFunc = op_dist_fn;
     *ppArg = (void *)"cosine";
-    return 152;
+    return VEC0_OP_DISTANCE_COSINE;
   }
   if (strcmp(zName, "vec_distance_ip") == 0) {
     *pxFunc = op_dist_fn;
     *ppArg = (void *)"ip";
-    return 153;
+    return VEC0_OP_DISTANCE_IP;
   }
   if (strcmp(zName, "vec_distance_l1") == 0) {
     *pxFunc = op_dist_fn;
     *ppArg = (void *)"l1";
-    return 154;
+    return VEC0_OP_DISTANCE_L1;
   }
   if (strcmp(zName, "vec_distance_hamming") == 0) {
     *pxFunc = op_dist_fn;
     *ppArg = (void *)"hamming";
-    return 155;
+    return VEC0_OP_DISTANCE_HAMMING;
   }
   if (strcmp(zName, "vec_distance_jaccard") == 0) {
     *pxFunc = op_dist_fn;
     *ppArg = (void *)"jaccard";
-    return 156;
+    return VEC0_OP_DISTANCE_JACCARD;
   }
   return 0;
 }
