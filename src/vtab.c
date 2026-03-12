@@ -57,6 +57,22 @@ struct Vec0Table {
   sqlite3_stmt *sc_rev_nbrs;  /* SELECT DISTINCT node_id FROM _graph WHERE
                                  layer=? AND neighbor_id=? */
 
+  /* Additional cached statements for hnsw_delete and config updates */
+  sqlite3_stmt *sc_get_layer;      /* SELECT max_layer FROM _layers WHERE
+                                      node_id=? */
+  sqlite3_stmt *sc_del_layer;      /* DELETE FROM _layers WHERE node_id=? */
+  sqlite3_stmt *sc_del_node_edges; /* DELETE FROM _graph WHERE node_id=? OR
+                                      neighbor_id=? */
+  sqlite3_stmt *sc_elect_ep;       /* SELECT node_id, max_layer FROM _layers
+                                      ORDER BY max_layer DESC LIMIT 1 */
+  sqlite3_stmt *sc_upd_config;     /* UPDATE _config SET value=? WHERE key=? */
+
+  /* Cached statements for _data table operations */
+  sqlite3_stmt *sc_ins_data;    /* INSERT INTO _data (vector) VALUES (?) */
+  sqlite3_stmt *sc_ins_data_id; /* INSERT INTO _data (id, vector) VALUES
+                                   (?,?) */
+  sqlite3_stmt *sc_del_data;    /* DELETE FROM _data WHERE id=? */
+
   /* ── Transaction state ─────────────────────────────────────────────────
    * Set by xBegin/cleared by xCommit or xRollback.  While in_txn==1,
    * config writes (count, entry_point, max_layer) are deferred: shadow-table
@@ -101,6 +117,14 @@ static void vec0_finalize_stmts(Vec0Table *p) {
   sqlite3_finalize(p->sc_ins_layer);
   sqlite3_finalize(p->sc_nbr_count);
   sqlite3_finalize(p->sc_rev_nbrs);
+  sqlite3_finalize(p->sc_get_layer);
+  sqlite3_finalize(p->sc_del_layer);
+  sqlite3_finalize(p->sc_del_node_edges);
+  sqlite3_finalize(p->sc_elect_ep);
+  sqlite3_finalize(p->sc_upd_config);
+  sqlite3_finalize(p->sc_ins_data);
+  sqlite3_finalize(p->sc_ins_data_id);
+  sqlite3_finalize(p->sc_del_data);
   p->sc_get_nbrs = NULL;
   p->sc_get_vec = NULL;
   p->sc_scan_ids = NULL;
@@ -110,6 +134,14 @@ static void vec0_finalize_stmts(Vec0Table *p) {
   p->sc_ins_layer = NULL;
   p->sc_nbr_count = NULL;
   p->sc_rev_nbrs = NULL;
+  p->sc_get_layer = NULL;
+  p->sc_del_layer = NULL;
+  p->sc_del_node_edges = NULL;
+  p->sc_elect_ep = NULL;
+  p->sc_upd_config = NULL;
+  p->sc_ins_data = NULL;
+  p->sc_ins_data_id = NULL;
+  p->sc_del_data = NULL;
 }
 
 static void vec0_free(Vec0Table *p) {
@@ -168,6 +200,27 @@ static int vec0_prepare_stmts(Vec0Table *p, char **pzErr) {
        "SELECT DISTINCT node_id FROM \"%w\".\"%w_graph\""
        " WHERE layer=? AND neighbor_id=?",
        p->schema, p->name);
+  PREP(sc_get_layer,
+       "SELECT max_layer FROM \"%w\".\"%w_layers\" WHERE node_id=?", p->schema,
+       p->name);
+  PREP(sc_del_layer, "DELETE FROM \"%w\".\"%w_layers\" WHERE node_id=?",
+       p->schema, p->name);
+  PREP(sc_del_node_edges,
+       "DELETE FROM \"%w\".\"%w_graph\" WHERE node_id=? OR neighbor_id=?",
+       p->schema, p->name);
+  PREP(sc_elect_ep,
+       "SELECT node_id, max_layer FROM \"%w\".\"%w_layers\""
+       " ORDER BY max_layer DESC LIMIT 1",
+       p->schema, p->name);
+  PREP(sc_upd_config, "UPDATE \"%w\".\"%w_config\" SET value=? WHERE key=?",
+       p->schema, p->name);
+  PREP(sc_ins_data, "INSERT INTO \"%w\".\"%w_data\" (vector) VALUES (?)",
+       p->schema, p->name);
+  PREP(sc_ins_data_id,
+       "INSERT INTO \"%w\".\"%w_data\" (id, vector) VALUES (?,?)", p->schema,
+       p->name);
+  PREP(sc_del_data, "DELETE FROM \"%w\".\"%w_data\" WHERE id=?", p->schema,
+       p->name);
 
 #undef PREP
   return SQLITE_OK;
@@ -192,7 +245,11 @@ static void vec0_make_hctx(Vec0Table *p, HnswCtx *out) {
   out->sc_ins_layer = p->sc_ins_layer;
   out->sc_nbr_count = p->sc_nbr_count;
   out->sc_rev_nbrs = p->sc_rev_nbrs;
-  /* Suppress _config DB writes inside a vtab transaction; xCommit flushes. */
+  out->sc_get_layer = p->sc_get_layer;
+  out->sc_del_layer = p->sc_del_layer;
+  out->sc_del_node_edges = p->sc_del_node_edges;
+  out->sc_elect_ep = p->sc_elect_ep;
+  out->sc_upd_config = p->sc_upd_config;
   out->defer_config = p->in_txn;
 }
 
@@ -212,6 +269,22 @@ static int vec0_declare(sqlite3 *db, const char *name, char **pzErr) {
   sqlite3_free(schema);
   if (rc != SQLITE_OK)
     *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(db));
+  return rc;
+}
+
+/* Ensure shadow-table indexes exist for both new and pre-existing vec0 tables.
+ * This runs in xCreate and xConnect so existing databases get online index
+ * migration without manual intervention. */
+static int vec0_ensure_shadow_indexes(Vec0Table *p, char **pzErr) {
+  char *sql =
+      sqlite3_mprintf("CREATE INDEX IF NOT EXISTS \"%w_graph_neighbor_idx\""
+                      " ON \"%w_graph\"(layer, neighbor_id)",
+                      p->name, p->name);
+  int rc = sqlite3_exec(p->db, sql, NULL, NULL, NULL);
+  sqlite3_free(sql);
+  if (rc != SQLITE_OK && pzErr) {
+    *pzErr = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
+  }
   return rc;
 }
 
@@ -417,6 +490,14 @@ static int vec0Init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
 
   {
     int rc = vec0_declare(db, p->name, pzErr);
+    if (rc != SQLITE_OK) {
+      vec0_free(p);
+      return rc;
+    }
+  }
+
+  {
+    int rc = vec0_ensure_shadow_indexes(p, pzErr);
     if (rc != SQLITE_OK) {
       vec0_free(p);
       return rc;
@@ -935,39 +1016,12 @@ static int vec0Eof(sqlite3_vtab_cursor *pCursor) {
 
 static void vec0_result_vector_text(Vec0Cursor *cur, sqlite3_context *ctx) {
   Vec0Table *p = (Vec0Table *)cur->base.pVtab;
-  if (p->sc_get_vec) {
-    vec0_stmt_rewind(p->sc_get_vec);
-    sqlite3_bind_int64(p->sc_get_vec, 1, cur->rowids[cur->pos]);
-    int step_rc = sqlite3_step(p->sc_get_vec);
-    if (step_rc == SQLITE_ROW) {
-      int bytes = sqlite3_column_bytes(p->sc_get_vec, 0);
-      const float *blob = (const float *)sqlite3_column_blob(p->sc_get_vec, 0);
-      int dims = bytes / (int)sizeof(float);
-      char *text = vec_format(blob, dims);
-      if (text)
-        sqlite3_result_text(ctx, text, -1, sqlite3_free);
-      else
-        sqlite3_result_null(ctx);
-    } else {
-      sqlite3_result_null(ctx);
-    }
-    vec0_stmt_rewind(p->sc_get_vec);
-    return;
-  }
-
-  char *sql =
-      sqlite3_mprintf("SELECT vector FROM \"%w\".\"%w_data\" WHERE id=%lld",
-                      p->schema, p->name, cur->rowids[cur->pos]);
-  sqlite3_stmt *stmt = NULL;
-  if (!sql || sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-    sqlite3_free(sql);
-    sqlite3_result_null(ctx);
-    return;
-  }
-  sqlite3_free(sql);
-  if (sqlite3_step(stmt) == SQLITE_ROW) {
-    int bytes = sqlite3_column_bytes(stmt, 0);
-    const float *blob = (const float *)sqlite3_column_blob(stmt, 0);
+  vec0_stmt_rewind(p->sc_get_vec);
+  sqlite3_bind_int64(p->sc_get_vec, 1, cur->rowids[cur->pos]);
+  int step_rc = sqlite3_step(p->sc_get_vec);
+  if (step_rc == SQLITE_ROW) {
+    int bytes = sqlite3_column_bytes(p->sc_get_vec, 0);
+    const float *blob = (const float *)sqlite3_column_blob(p->sc_get_vec, 0);
     int dims = bytes / (int)sizeof(float);
     char *text = vec_format(blob, dims);
     if (text)
@@ -977,7 +1031,7 @@ static void vec0_result_vector_text(Vec0Cursor *cur, sqlite3_context *ctx) {
   } else {
     sqlite3_result_null(ctx);
   }
-  sqlite3_finalize(stmt);
+  vec0_stmt_rewind(p->sc_get_vec);
 }
 
 /* ── xColumn ─────────────────────────────────────────────────────────────────
@@ -1046,18 +1100,15 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     sqlite3_int64 del_rowid = sqlite3_value_int64(argv[0]);
 
     /* Remove from _data */
-    char *dsql = sqlite3_mprintf("DELETE FROM \"%w\".\"%w_data\" WHERE id=%lld",
-                                 p->schema, p->name, del_rowid);
-    sqlite3_exec(p->db, dsql, NULL, NULL, NULL);
-    sqlite3_free(dsql);
+    vec0_stmt_rewind(p->sc_del_data);
+    sqlite3_bind_int64(p->sc_del_data, 1, del_rowid);
+    sqlite3_step(p->sc_del_data);
 
-    /* Remove from HNSW graph — check return code (was previously ignored). */
+    /* Remove from HNSW graph */
     HnswCtx hctx;
     vec0_make_hctx(p, &hctx);
     int drc = hnsw_delete(&hctx, del_rowid);
     if (drc != SQLITE_OK) {
-      /* SQLite auto-rollback undoes the _data DELETE and any graph writes.
-       * In-memory state is still unchanged (p fields not yet modified). */
       pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
       return drc;
     }
@@ -1067,11 +1118,12 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     if (p->count > 0)
       p->count--;
     if (!p->in_txn) {
-      char *csql = sqlite3_mprintf(
-          "UPDATE \"%w\".\"%w_config\" SET value='%lld' WHERE key='count'",
-          p->schema, p->name, p->count);
-      sqlite3_exec(p->db, csql, NULL, NULL, NULL);
-      sqlite3_free(csql);
+      char buf[32];
+      sqlite3_snprintf((int)sizeof(buf), buf, "%lld", p->count);
+      vec0_stmt_rewind(p->sc_upd_config);
+      sqlite3_bind_text(p->sc_upd_config, 1, buf, -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(p->sc_upd_config, 2, "count", -1, SQLITE_STATIC);
+      sqlite3_step(p->sc_upd_config);
     }
     return SQLITE_OK;
   }
@@ -1111,16 +1163,14 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     int pre_ml = p->max_layer;
 
     /* Delete old row from _data and HNSW graph */
-    char *dsql = sqlite3_mprintf("DELETE FROM \"%w\".\"%w_data\" WHERE id=%lld",
-                                 p->schema, p->name, old_rowid);
-    sqlite3_exec(p->db, dsql, NULL, NULL, NULL);
-    sqlite3_free(dsql);
+    vec0_stmt_rewind(p->sc_del_data);
+    sqlite3_bind_int64(p->sc_del_data, 1, old_rowid);
+    sqlite3_step(p->sc_del_data);
 
     HnswCtx del_ctx;
     vec0_make_hctx(p, &del_ctx);
     upd_rc = hnsw_delete(&del_ctx, old_rowid);
     if (upd_rc != SQLITE_OK) {
-      /* SQLite auto-rollback undoes shadow writes; restore in-memory state. */
       p->count = pre_count;
       p->entry_point = pre_ep;
       p->max_layer = pre_ml;
@@ -1134,24 +1184,11 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
       p->count--;
 
     /* Re-insert with same rowid */
-    char *ins_sql = sqlite3_mprintf(
-        "INSERT INTO \"%w\".\"%w_data\" (id, vector) VALUES (%lld, ?)",
-        p->schema, p->name, old_rowid);
-    sqlite3_stmt *ins_stmt = NULL;
-    upd_rc = sqlite3_prepare_v2(p->db, ins_sql, -1, &ins_stmt, NULL);
-    sqlite3_free(ins_sql);
-    if (upd_rc != SQLITE_OK) {
-      p->count = pre_count;
-      p->entry_point = pre_ep;
-      p->max_layer = pre_ml;
-      sqlite3_free(upd_vec);
-      pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
-      return upd_rc;
-    }
-    sqlite3_bind_blob(ins_stmt, 1, upd_vec, upd_dims * (int)sizeof(float),
-                      SQLITE_STATIC);
-    upd_rc = sqlite3_step(ins_stmt);
-    sqlite3_finalize(ins_stmt);
+    vec0_stmt_rewind(p->sc_ins_data_id);
+    sqlite3_bind_int64(p->sc_ins_data_id, 1, old_rowid);
+    sqlite3_bind_blob(p->sc_ins_data_id, 2, upd_vec,
+                      upd_dims * (int)sizeof(float), SQLITE_STATIC);
+    upd_rc = sqlite3_step(p->sc_ins_data_id);
     if (upd_rc != SQLITE_DONE) {
       p->count = pre_count;
       p->entry_point = pre_ep;
@@ -1166,13 +1203,9 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     /* Re-insert into HNSW graph */
     HnswCtx ins_ctx;
     vec0_make_hctx(p, &ins_ctx);
-    /* entry_point/max_layer were updated by hnsw_delete above */
-    ins_ctx.entry_point = p->entry_point;
-    ins_ctx.max_layer = p->max_layer;
     upd_rc = hnsw_insert(&ins_ctx, old_rowid, upd_vec);
     sqlite3_free(upd_vec);
     if (upd_rc != SQLITE_OK) {
-      /* count: net of delete+insert is still pre_count */
       p->count = pre_count;
       p->entry_point = pre_ep;
       p->max_layer = pre_ml;
@@ -1181,14 +1214,13 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     }
     p->entry_point = ins_ctx.entry_point;
     p->max_layer = ins_ctx.max_layer;
-    /* count is unchanged net (delete+reinsert); write config if not deferred */
     if (!p->in_txn) {
-      char *cnt_sql =
-          sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%lld'"
-                          " WHERE key='count'",
-                          p->schema, p->name, p->count);
-      sqlite3_exec(p->db, cnt_sql, NULL, NULL, NULL);
-      sqlite3_free(cnt_sql);
+      char buf[32];
+      sqlite3_snprintf((int)sizeof(buf), buf, "%lld", p->count);
+      vec0_stmt_rewind(p->sc_upd_config);
+      sqlite3_bind_text(p->sc_upd_config, 1, buf, -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(p->sc_upd_config, 2, "count", -1, SQLITE_STATIC);
+      sqlite3_step(p->sc_upd_config);
     }
     return SQLITE_OK;
   }
@@ -1217,24 +1249,14 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     return SQLITE_CONSTRAINT;
   }
 
-  /* Insert raw float BLOB into _data.
+  /* Insert raw float BLOB into _data using cached statement.
    * SQLite's automatic statement savepoint ensures that if hnsw_insert later
    * fails and we return an error, the _data row and any partial graph writes
    * are rolled back automatically by SQLite. */
-  char *sql = sqlite3_mprintf(
-      "INSERT INTO \"%w\".\"%w_data\" (vector) VALUES (?)", p->schema, p->name);
-  sqlite3_stmt *stmt = NULL;
-  rc = sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL);
-  sqlite3_free(sql);
-  if (rc != SQLITE_OK) {
-    sqlite3_free(vec);
-    pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
-    return rc;
-  }
-  /* Use SQLITE_STATIC so vec stays alive until after hnsw_insert. */
-  sqlite3_bind_blob(stmt, 1, vec, dims * (int)sizeof(float), SQLITE_STATIC);
-  rc = sqlite3_step(stmt);
-  sqlite3_finalize(stmt);
+  vec0_stmt_rewind(p->sc_ins_data);
+  sqlite3_bind_blob(p->sc_ins_data, 1, vec, dims * (int)sizeof(float),
+                    SQLITE_STATIC);
+  rc = sqlite3_step(p->sc_ins_data);
   if (rc != SQLITE_DONE) {
     sqlite3_free(vec);
     pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
@@ -1250,8 +1272,6 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
   rc = hnsw_insert(&hctx, *pRowid, vec);
   sqlite3_free(vec);
   if (rc != SQLITE_OK) {
-    /* SQLite auto-rollback undoes the _data insert and any partial graph
-     * writes.  Undo the in-memory count increment. */
     p->count--;
     pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
     return rc;
@@ -1261,11 +1281,12 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
   /* Keep count in _config in sync (deferred to xCommit when in_txn) */
   if (!p->in_txn) {
-    sql = sqlite3_mprintf(
-        "UPDATE \"%w\".\"%w_config\" SET value = '%lld' WHERE key = 'count'",
-        p->schema, p->name, p->count);
-    sqlite3_exec(p->db, sql, NULL, NULL, NULL);
-    sqlite3_free(sql);
+    char buf[32];
+    sqlite3_snprintf((int)sizeof(buf), buf, "%lld", p->count);
+    vec0_stmt_rewind(p->sc_upd_config);
+    sqlite3_bind_text(p->sc_upd_config, 1, buf, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(p->sc_upd_config, 2, "count", -1, SQLITE_STATIC);
+    sqlite3_step(p->sc_upd_config);
   }
   return SQLITE_OK;
 }
@@ -1354,25 +1375,21 @@ static int vec0Begin(sqlite3_vtab *pVtab) {
   return SQLITE_OK;
 }
 
+static void vec0_write_config(Vec0Table *p, const char *key,
+                              sqlite3_int64 val) {
+  char buf[32];
+  sqlite3_snprintf((int)sizeof(buf), buf, "%lld", val);
+  vec0_stmt_rewind(p->sc_upd_config);
+  sqlite3_bind_text(p->sc_upd_config, 1, buf, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(p->sc_upd_config, 2, key, -1, SQLITE_STATIC);
+  sqlite3_step(p->sc_upd_config);
+}
+
 static int vec0Commit(sqlite3_vtab *pVtab) {
   Vec0Table *p = (Vec0Table *)pVtab;
-  char *sql;
-  /* Write all three mutable config values in one go. */
-  sql = sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%lld'"
-                        " WHERE key='count'",
-                        p->schema, p->name, p->count);
-  sqlite3_exec(p->db, sql, NULL, NULL, NULL);
-  sqlite3_free(sql);
-  sql = sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%lld'"
-                        " WHERE key='entry_point'",
-                        p->schema, p->name, p->entry_point);
-  sqlite3_exec(p->db, sql, NULL, NULL, NULL);
-  sqlite3_free(sql);
-  sql = sqlite3_mprintf("UPDATE \"%w\".\"%w_config\" SET value='%d'"
-                        " WHERE key='max_layer'",
-                        p->schema, p->name, p->max_layer);
-  sqlite3_exec(p->db, sql, NULL, NULL, NULL);
-  sqlite3_free(sql);
+  vec0_write_config(p, "count", p->count);
+  vec0_write_config(p, "entry_point", p->entry_point);
+  vec0_write_config(p, "max_layer", (sqlite3_int64)p->max_layer);
   p->in_txn = 0;
   return SQLITE_OK;
 }

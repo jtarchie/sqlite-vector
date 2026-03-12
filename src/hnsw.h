@@ -27,27 +27,27 @@ typedef struct HnswCtx {
   /* If non-zero, update_config() skips DB writes (deferred to xCommit). */
   int defer_config;
 
-  /*
-   * Optional pre-prepared (borrowed) statements — populated by vtab.c from
-   * the Vec0Table statement cache.  If non-NULL, hnsw_* functions use them
-   * directly and skip local prepare/finalize (big win for bulk inserts).
-   * If NULL, each hnsw_* function prepares its own local copies.
-   * The caller owns these; hnsw_* never finalizes them.
-   */
-  sqlite3_stmt *sc_get_nbrs; /* SELECT neighbor_id, distance FROM _graph WHERE
-                                layer=? AND node_id=? */
-  sqlite3_stmt *sc_get_vec;  /* SELECT vector FROM _data WHERE id=? */
-  sqlite3_stmt *sc_ins_edge; /* INSERT OR REPLACE INTO
-                                _graph(layer,node_id,neighbor_id,distance)
-                                VALUES(?,?,?,?) */
-  sqlite3_stmt
-      *sc_del_edges; /* DELETE FROM _graph WHERE layer=? AND node_id=? */
-  sqlite3_stmt *sc_ins_layer; /* INSERT OR REPLACE INTO
-                                 _layers(node_id,max_layer) VALUES(?,?) */
-  sqlite3_stmt *sc_nbr_count; /* SELECT COUNT(*) FROM _graph WHERE layer=? AND
-                                 node_id=? */
-  sqlite3_stmt *sc_rev_nbrs;  /* SELECT DISTINCT node_id FROM _graph WHERE
-                                 layer=? AND neighbor_id=? */
+  /* Cached prepared statements — must all be populated before calling
+   * hnsw_*.  Owned by the vtab; hnsw_* functions never finalize them. */
+  sqlite3_stmt *sc_get_nbrs;       /* SELECT neighbor_id, distance FROM _graph
+                                      WHERE layer=? AND node_id=? */
+  sqlite3_stmt *sc_get_vec;        /* SELECT vector FROM _data WHERE id=? */
+  sqlite3_stmt *sc_ins_edge;       /* INSERT OR REPLACE INTO _graph(...) */
+  sqlite3_stmt *sc_del_edges;      /* DELETE FROM _graph WHERE layer=? AND
+                                      node_id=? */
+  sqlite3_stmt *sc_ins_layer;      /* INSERT OR REPLACE INTO _layers(...) */
+  sqlite3_stmt *sc_nbr_count;      /* SELECT COUNT(*) FROM _graph WHERE layer=?
+                                      AND node_id=? */
+  sqlite3_stmt *sc_rev_nbrs;       /* SELECT DISTINCT node_id FROM _graph WHERE
+                                      layer=? AND neighbor_id=? */
+  sqlite3_stmt *sc_get_layer;      /* SELECT max_layer FROM _layers WHERE
+                                      node_id=? */
+  sqlite3_stmt *sc_del_layer;      /* DELETE FROM _layers WHERE node_id=? */
+  sqlite3_stmt *sc_del_node_edges; /* DELETE FROM _graph WHERE node_id=? OR
+                                      neighbor_id=? */
+  sqlite3_stmt *sc_elect_ep;       /* SELECT node_id, max_layer FROM _layers
+                                      ORDER BY max_layer DESC LIMIT 1 */
+  sqlite3_stmt *sc_upd_config;     /* UPDATE _config SET value=? WHERE key=? */
 } HnswCtx;
 
 /*
