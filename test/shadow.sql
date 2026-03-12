@@ -25,6 +25,9 @@ INSERT INTO assert VALUES(
 INSERT INTO assert VALUES(
   (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='items_layers') = 1
 );
+INSERT INTO assert VALUES(
+  (SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='items_graph_neighbor_idx') = 1
+);
 
 -- ── Config values persisted correctly ─────────────────────────────────────
 INSERT INTO assert VALUES(
@@ -63,6 +66,9 @@ INSERT INTO assert VALUES(
 );
 INSERT INTO assert VALUES(
   (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='items_layers') = 0
+);
+INSERT INTO assert VALUES(
+  (SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='items_graph_neighbor_idx') = 0
 );
 
 SELECT 'shadow tests passed';

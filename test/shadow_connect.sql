@@ -12,6 +12,11 @@ CREATE TEMP TABLE assert(val INTEGER NOT NULL CHECK(val));
 -- (read from _config, not from CREATE VIRTUAL TABLE argv).
 INSERT INTO assert VALUES(vec_dims('[1,2,3,4]') = 4);
 
+-- Reverse-neighbor index must survive xConnect reconnect.
+INSERT INTO assert VALUES(
+  (SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='items_graph_neighbor_idx') = 1
+);
+
 -- Query the virtual table; returns empty but must not error.
 SELECT COUNT(*) FROM items WHERE items MATCH '[0.1,0.2,0.3,0.4]';
 
