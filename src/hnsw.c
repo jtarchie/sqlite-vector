@@ -230,16 +230,16 @@ static int visited_add(VisitedSet *v, sqlite3_int64 id) {
  * Caller must NOT sqlite3_free *out_vec.
  */
 static int fetch_vector_stmt(sqlite3_stmt *stmt_get_vec, sqlite3_int64 id,
-                             const float **out_vec, int dims) {
+                             const void **out_vec, int dims, int storage_type) {
   sqlite3_reset(stmt_get_vec);
   sqlite3_bind_int64(stmt_get_vec, 1, id);
   int rc = sqlite3_step(stmt_get_vec);
   if (rc != SQLITE_ROW)
     return SQLITE_ERROR;
   int bytes = sqlite3_column_bytes(stmt_get_vec, 0);
-  if (bytes != dims * (int)sizeof(float))
+  if (bytes != vec_blob_bytes(storage_type, dims))
     return SQLITE_ERROR;
-  *out_vec = (const float *)sqlite3_column_blob(stmt_get_vec, 0);
+  *out_vec = sqlite3_column_blob(stmt_get_vec, 0);
   return SQLITE_OK;
 }
 
@@ -273,7 +273,7 @@ static int update_config(HnswCtx *ctx, const char *key, sqlite3_int64 val) {
  *   W              — pre-initialised empty max-heap; filled with ≤ef nearest
  *                    nodes found at this layer (caller frees)
  * ══════════════════════════════════════════════════════════════════════════ */
-static int search_layer(HnswCtx *ctx, const float *query, sqlite3_int64 ep_id,
+static int search_layer(HnswCtx *ctx, const void *query, sqlite3_int64 ep_id,
                         double ep_dist, int ef, int lc,
                         sqlite3_stmt *stmt_get_nbrs, sqlite3_stmt *stmt_get_vec,
                         Heap *W) {
@@ -321,8 +321,9 @@ static int search_layer(HnswCtx *ctx, const float *query, sqlite3_int64 ep_id,
         goto done;
 
       /* Fetch vector and compute distance to query */
-      const float *e_vec = NULL;
-      if (fetch_vector_stmt(stmt_get_vec, e_id, &e_vec, ctx->dims) != SQLITE_OK)
+      const void *e_vec = NULL;
+      if (fetch_vector_stmt(stmt_get_vec, e_id, &e_vec, ctx->dims,
+                            ctx->storage_type) != SQLITE_OK)
         continue; /* skip deleted/missing nodes */
 
       double e_dist = 0.0;
@@ -351,7 +352,7 @@ done:
 /* ══════════════════════════════════════════════════════════════════════════
  * hnsw_search
  * ══════════════════════════════════════════════════════════════════════════ */
-int hnsw_search(HnswCtx *ctx, const float *query_vec, int k,
+int hnsw_search(HnswCtx *ctx, const void *query_vec, int k,
                 HnswResult **out_results, int *out_n) {
   *out_results = NULL;
   *out_n = 0;
@@ -364,8 +365,9 @@ int hnsw_search(HnswCtx *ctx, const float *query_vec, int k,
   sqlite3_stmt *stmt_get_vec = ctx->sc_get_vec;
 
   /* Distance from query to entry point */
-  const float *ep_vec = NULL;
-  rc = fetch_vector_stmt(stmt_get_vec, ctx->entry_point, &ep_vec, ctx->dims);
+  const void *ep_vec = NULL;
+  rc = fetch_vector_stmt(stmt_get_vec, ctx->entry_point, &ep_vec, ctx->dims,
+                         ctx->storage_type);
   if (rc != SQLITE_OK)
     return rc;
 
@@ -493,7 +495,7 @@ static int set_connections(HnswCtx *ctx, int lc, sqlite3_int64 node_id,
 /* ══════════════════════════════════════════════════════════════════════════
  * hnsw_insert — Algorithm 1 (insert) from the HNSW paper.
  * ══════════════════════════════════════════════════════════════════════════ */
-int hnsw_insert(HnswCtx *ctx, sqlite3_int64 rowid, const float *vec) {
+int hnsw_insert(HnswCtx *ctx, sqlite3_int64 rowid, const void *vec) {
   int rc = SQLITE_OK;
 
   /* Sample random level: l = floor(-ln(U(0,1)) / ln(M)) */
@@ -528,8 +530,9 @@ int hnsw_insert(HnswCtx *ctx, sqlite3_int64 rowid, const float *vec) {
   }
 
   /* Distance from new node to current entry point */
-  const float *ep_vec = NULL;
-  rc = fetch_vector_stmt(stmt_get_vec, ctx->entry_point, &ep_vec, ctx->dims);
+  const void *ep_vec = NULL;
+  rc = fetch_vector_stmt(stmt_get_vec, ctx->entry_point, &ep_vec, ctx->dims,
+                         ctx->storage_type);
   if (rc != SQLITE_OK)
     return rc;
 
@@ -751,7 +754,8 @@ int hnsw_delete(HnswCtx *ctx, sqlite3_int64 rowid) {
 
   /* ── Step 6: Graph repair ─────────────────────────────────────────────── */
   if (ctx->entry_point >= 0 && n_repairs > 0) {
-    float *n_vec_copy = sqlite3_malloc(ctx->dims * (int)sizeof(float));
+    int vec_bytes = vec_blob_bytes(ctx->storage_type, ctx->dims);
+    void *n_vec_copy = sqlite3_malloc(vec_bytes);
     if (!n_vec_copy) {
       sqlite3_free(repairs);
       return SQLITE_NOMEM;
@@ -761,14 +765,15 @@ int hnsw_delete(HnswCtx *ctx, sqlite3_int64 rowid) {
       int lc = repairs[i].lc;
       sqlite3_int64 nid = repairs[i].nid;
 
-      const float *n_raw = NULL;
-      if (fetch_vector_stmt(stmt_get_vec, nid, &n_raw, ctx->dims) != SQLITE_OK)
+      const void *n_raw = NULL;
+      if (fetch_vector_stmt(stmt_get_vec, nid, &n_raw, ctx->dims,
+                            ctx->storage_type) != SQLITE_OK)
         continue;
-      memcpy(n_vec_copy, n_raw, ctx->dims * (int)sizeof(float));
+      memcpy(n_vec_copy, n_raw, vec_bytes);
 
-      const float *ep_raw = NULL;
-      if (fetch_vector_stmt(stmt_get_vec, ctx->entry_point, &ep_raw,
-                            ctx->dims) != SQLITE_OK)
+      const void *ep_raw = NULL;
+      if (fetch_vector_stmt(stmt_get_vec, ctx->entry_point, &ep_raw, ctx->dims,
+                            ctx->storage_type) != SQLITE_OK)
         continue;
       double ep_dist = 0.0;
       ctx->dist_fn(n_vec_copy, ep_raw, ctx->dims, &ep_dist);

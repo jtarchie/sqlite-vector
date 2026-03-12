@@ -6,20 +6,16 @@
 /*
  * dist_fn_t — common signature for all distance kernels.
  *
- * a, b : input float vectors of length dims
- * dims : number of elements
+ * a, b : input vectors of length dims (type depends on storage format)
+ * dims : number of elements (for binary: number of bits)
  * out  : receives the scalar distance (written as double)
- *
- * Hamming / Jaccard kernels treat the float arrays as packed bit-vectors:
- * each 4-byte float element is one 32-bit word of bits, so dims must be a
- * multiple of 8 for those metrics (SimSIMD's b8 kernels operate on bytes).
  */
-typedef void (*dist_fn_t)(const float *a, const float *b, int dims,
-                          double *out);
+typedef void (*dist_fn_t)(const void *a, const void *b, int dims, double *out);
 
 /* distance_for_metric
  * Returns the dist_fn_t matching the named metric string, or NULL if the
- * name is not recognised.  Accepted names match the PLAN.md list:
+ * name is not recognised.  Returns the float32 kernel.
+ * Accepted names:
  *   "l2", "l2sq", "euclidean",
  *   "cosine", "cos",
  *   "ip", "dot", "inner_product",
@@ -28,6 +24,14 @@ typedef void (*dist_fn_t)(const float *a, const float *b, int dims,
  *   "jaccard"
  */
 dist_fn_t distance_for_metric(const char *metric);
+
+/* distance_for_metric_typed
+ * Returns the dist_fn_t for the given metric + storage type combination.
+ * storage_type: VEC_STORAGE_F32, VEC_STORAGE_INT8, or VEC_STORAGE_BIT
+ *   (enum values from vtab.h).
+ * Returns NULL for unsupported metric+type combinations.
+ */
+dist_fn_t distance_for_metric_typed(const char *metric, int storage_type);
 
 /* distance_register_functions
  * Registers the following SQL scalar functions on db:

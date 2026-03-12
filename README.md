@@ -217,6 +217,7 @@ Create a virtual table with the `vec0` module:
 CREATE VIRTUAL TABLE table_name USING vec0(
   dims=N,                      -- REQUIRED: vector dimensions (1-8192)
   metric='metric_name',        -- Distance metric (default: 'cosine')
+  type='float32',              -- Storage type (default: 'float32')
   m=16,                        -- HNSW M parameter (default: 16)
   ef_construction=200,         -- Build-time search width (default: 200)
   ef_search=10                 -- Query-time search width (default: 10)
@@ -225,13 +226,14 @@ CREATE VIRTUAL TABLE table_name USING vec0(
 
 ### Parameters
 
-| Parameter         | Required | Default  | Description                    |
-| ----------------- | -------- | -------- | ------------------------------ |
-| `dims`            | Yes      | -        | Vector dimensionality (1-8192) |
-| `metric`          | No       | `cosine` | Distance metric to use         |
-| `m`               | No       | `16`     | Max connections per HNSW layer |
-| `ef_construction` | No       | `200`    | Beam width during index build  |
-| `ef_search`       | No       | `10`     | Beam width during search       |
+| Parameter         | Required | Default   | Description                    |
+| ----------------- | -------- | --------- | ------------------------------ |
+| `dims`            | Yes      | -         | Vector dimensionality (1-8192) |
+| `metric`          | No       | `cosine`  | Distance metric to use         |
+| `type`            | No       | `float32` | Vector storage type            |
+| `m`               | No       | `16`      | Max connections per HNSW layer |
+| `ef_construction` | No       | `200`     | Beam width during index build  |
+| `ef_search`       | No       | `10`      | Beam width during search       |
 
 ### Supported Metrics
 
@@ -243,6 +245,30 @@ CREATE VIRTUAL TABLE table_name USING vec0(
 | `l1`      | `manhattan`, `taxicab` | Manhattan distance                      | Grid-based distance    |
 | `hamming` | -                      | Hamming distance                        | Binary vectors         |
 | `jaccard` | -                      | Jaccard distance                        | Set similarity         |
+
+### Storage Types
+
+| Type      | Aliases | Bytes/dim | Supported Metrics                    | Use Case                       |
+| --------- | ------- | --------- | ------------------------------------ | ------------------------------ |
+| `float32` | `f32`   | 4         | l2, cosine, ip, l1, hamming, jaccard | Default, full precision        |
+| `int8`    | `i8`    | 1         | l2, cosine, ip, l1                   | 75% smaller, embedding search  |
+| `binary`  | `bit`   | 1/8       | hamming, jaccard                     | 97% smaller, binary hash codes |
+
+#### Int8 Quantization Precision
+
+When `type=int8` is set, float inputs are quantized to int8 at INSERT time using
+absmax scaling: each dimension is scaled by `127 / max(|v|)` and clamped to
+[-128, 127].
+
+Distance kernels operate directly on the stored int8 values — they do **not**
+reconstruct floats first. For cosine distance, SimSIMD computes
+`1 - dot(a,b) / (||a|| * ||b||)` using integer arithmetic (int8 inputs
+accumulated into int32). Because linear quantization preserves direction,
+nearest-neighbor **ranking** is equivalent to float32 for typical embedding
+workloads. Absolute distance values will differ from float32.
+
+Typical recall impact is < 1–2% for 768-dim embeddings. Smaller dimensions or
+highly non-uniform value distributions may see larger differences.
 
 ### Examples
 
@@ -262,6 +288,26 @@ CREATE VIRTUAL TABLE documents USING vec0(
   dims=768,
   metric=cosine,
   ef_search=50           -- Higher recall at query time
+);
+```
+
+**Int8 vectors (75% storage reduction):**
+
+```sql
+CREATE VIRTUAL TABLE embeddings_i8 USING vec0(
+  dims=768,
+  metric=cosine,
+  type=int8              -- Floats quantized to int8 at INSERT
+);
+```
+
+**Binary vectors:**
+
+```sql
+CREATE VIRTUAL TABLE hashes USING vec0(
+  dims=256,
+  metric=hamming,
+  type=binary            -- Bit-packed, 32 bytes per vector
 );
 ```
 
@@ -445,6 +491,10 @@ LIMIT 100;
 
 Distance functions can be used standalone or for metric override in KNN queries.
 
+> **Note:** The `vec_distance_*` scalar functions parse text input as float32.
+> For native int8 or binary scalar distance computation, use the typed variants
+> (`vec_distance_l2_i8`, `vec_distance_hamming_bit`, etc.).
+
 ### All Distance Functions
 
 | Function                     | Description            | Range   |
@@ -455,6 +505,23 @@ Distance functions can be used standalone or for metric override in KNN queries.
 | `vec_distance_l1(a, b)`      | Manhattan distance     | [0, ∞)  |
 | `vec_distance_hamming(a, b)` | Hamming distance       | [0, n]  |
 | `vec_distance_jaccard(a, b)` | Jaccard distance       | [0, 1]  |
+
+**Typed int8 distance functions** — inputs are JSON int arrays, e.g.
+`'[1,-2,127]'`:
+
+| Function                       | Description                   | Range   |
+| ------------------------------ | ----------------------------- | ------- |
+| `vec_distance_l2_i8(a, b)`     | Euclidean distance (int8)     | [0, ∞)  |
+| `vec_distance_cosine_i8(a, b)` | Cosine distance (int8)        | [0, 2]  |
+| `vec_distance_ip_i8(a, b)`     | Negative inner product (int8) | (-∞, ∞) |
+| `vec_distance_l1_i8(a, b)`     | Manhattan distance (int8)     | [0, ∞)  |
+
+**Typed binary distance functions** — inputs are BLOBs, e.g. `X'FF00'`:
+
+| Function                         | Description                   | Range  |
+| -------------------------------- | ----------------------------- | ------ |
+| `vec_distance_hamming_bit(a, b)` | Hamming distance (bit-packed) | [0, n] |
+| `vec_distance_jaccard_bit(a, b)` | Jaccard distance (bit-packed) | [0, 1] |
 
 ### Standalone Usage
 
@@ -976,6 +1043,22 @@ SELECT MAX(cnt) FROM (
 | `vec_distance_hamming(a, b)` | REAL    | Hamming distance       |
 | `vec_distance_jaccard(a, b)` | REAL    | Jaccard distance       |
 
+**Typed distance (int8)** — inputs are JSON int arrays, e.g. `'[1,-2,127]'`:
+
+| Function                       | Returns | Description                   |
+| ------------------------------ | ------- | ----------------------------- |
+| `vec_distance_l2_i8(a, b)`     | REAL    | Euclidean distance (int8)     |
+| `vec_distance_cosine_i8(a, b)` | REAL    | Cosine distance (int8)        |
+| `vec_distance_ip_i8(a, b)`     | REAL    | Negative inner product (int8) |
+| `vec_distance_l1_i8(a, b)`     | REAL    | Manhattan distance (int8)     |
+
+**Typed distance (binary)** — inputs are BLOBs, e.g. `X'FF00'`:
+
+| Function                         | Returns | Description                   |
+| -------------------------------- | ------- | ----------------------------- |
+| `vec_distance_hamming_bit(a, b)` | REAL    | Hamming distance (bit-packed) |
+| `vec_distance_jaccard_bit(a, b)` | REAL    | Jaccard distance (bit-packed) |
+
 #### Vector Operations
 
 | Function                   | Returns | Description                    |
@@ -1000,6 +1083,7 @@ SELECT MAX(cnt) FROM (
 | ----------------- | ------- | --------- | ------------ | -------------------------- |
 | `dims`            | INTEGER | 1-8192    | **required** | Vector dimensions          |
 | `metric`          | TEXT    | see below | `cosine`     | Distance metric            |
+| `type`            | TEXT    | see below | `float32`    | Vector storage type        |
 | `m`               | INTEGER | 2-100     | `16`         | HNSW connections per layer |
 | `ef_construction` | INTEGER | 1-1000    | `200`        | Build-time beam width      |
 | `ef_search`       | INTEGER | 1-1000    | `10`         | Query-time beam width      |

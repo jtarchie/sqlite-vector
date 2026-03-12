@@ -26,11 +26,12 @@ typedef struct Vec0Table Vec0Table;
 struct Vec0Table {
   sqlite3_vtab base; /* Must be first */
   sqlite3 *db;
-  char *name;   /* Virtual table name (for shadow table names) */
-  char *schema; /* Schema name */
-  int dims;     /* Vector dimensionality */
-  char *metric; /* Distance metric name */
-  int m;        /* HNSW M parameter */
+  char *name;       /* Virtual table name (for shadow table names) */
+  char *schema;     /* Schema name */
+  int dims;         /* Vector dimensionality */
+  char *metric;     /* Distance metric name */
+  int storage_type; /* VEC_STORAGE_F32/INT8/BIT */
+  int m;            /* HNSW M parameter */
   int ef_construction;
   int ef_search;
   sqlite3_int64 entry_point; /* Rowid of the current HNSW entry-point node */
@@ -105,6 +106,46 @@ static int parse_arg(const char *arg, const char *key, char **out_val) {
     return 1;
   }
   return 0;
+}
+
+/* Convert float vector to the native storage type.
+ * Returns a newly allocated blob (caller must sqlite3_free) and sets *out_bytes
+ * to the blob size.  For VEC_STORAGE_F32, returns NULL (caller should use the
+ * float array directly). */
+static void *vec_convert_to_storage(const float *fvec, int dims,
+                                    int storage_type, int *out_bytes) {
+  if (storage_type == VEC_STORAGE_INT8) {
+    int nbytes = dims;
+    int8_t *buf = sqlite3_malloc(nbytes);
+    if (!buf)
+      return NULL;
+    for (int i = 0; i < dims; i++) {
+      float v = fvec[i];
+      if (v < -128.0f)
+        v = -128.0f;
+      if (v > 127.0f)
+        v = 127.0f;
+      buf[i] = (int8_t)(v < 0 ? v - 0.5f : v + 0.5f);
+    }
+    *out_bytes = nbytes;
+    return buf;
+  }
+  if (storage_type == VEC_STORAGE_BIT) {
+    int nbytes = (dims + 7) / 8;
+    uint8_t *buf = sqlite3_malloc(nbytes);
+    if (!buf)
+      return NULL;
+    memset(buf, 0, nbytes);
+    for (int i = 0; i < dims; i++) {
+      if (fvec[i] > 0.0f)
+        buf[i / 8] |= (uint8_t)(1 << (7 - (i % 8)));
+    }
+    *out_bytes = nbytes;
+    return buf;
+  }
+  /* VEC_STORAGE_F32 — signal caller to use float array directly */
+  *out_bytes = dims * (int)sizeof(float);
+  return NULL;
 }
 
 static void vec0_finalize_stmts(Vec0Table *p) {
@@ -237,6 +278,7 @@ static void vec0_make_hctx(Vec0Table *p, HnswCtx *out) {
   out->ef_search = p->ef_search;
   out->entry_point = p->entry_point;
   out->max_layer = p->max_layer;
+  out->storage_type = p->storage_type;
   out->dist_fn = p->dist_fn;
   out->sc_get_nbrs = p->sc_get_nbrs;
   out->sc_get_vec = p->sc_get_vec;
@@ -355,9 +397,13 @@ static int vec0_create_shadow(Vec0Table *p, char **pzErr) {
   sql = sqlite3_mprintf("INSERT INTO \"%w\".\"%w_config\" (key, value) VALUES "
                         "('dims','%d'),('metric','%q'),('m','%d'),"
                         "('ef_construction','%d'),('ef_search','%d'),"
+                        "('type','%q'),"
                         "('entry_point','-1'),('max_layer','0'),('count','0')",
                         s, n, p->dims, p->metric, p->m, p->ef_construction,
-                        p->ef_search);
+                        p->ef_search,
+                        p->storage_type == VEC_STORAGE_INT8  ? "int8"
+                        : p->storage_type == VEC_STORAGE_BIT ? "binary"
+                                                             : "float32");
   rc = sqlite3_exec(p->db, sql, NULL, NULL, NULL);
   sqlite3_free(sql);
   if (rc != SQLITE_OK)
@@ -398,6 +444,14 @@ static int vec0_read_config(Vec0Table *p, char **pzErr) {
       p->max_layer = atoi(val);
     else if (strcmp(key, "count") == 0)
       p->count = (sqlite3_int64)atoll(val);
+    else if (strcmp(key, "type") == 0) {
+      if (strcmp(val, "int8") == 0)
+        p->storage_type = VEC_STORAGE_INT8;
+      else if (strcmp(val, "binary") == 0 || strcmp(val, "bit") == 0)
+        p->storage_type = VEC_STORAGE_BIT;
+      else
+        p->storage_type = VEC_STORAGE_F32;
+    }
   }
   sqlite3_finalize(stmt);
   return SQLITE_OK;
@@ -445,6 +499,20 @@ static int vec0Init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
       } else if (parse_arg(argv[i], "ef_search", &val)) {
         p->ef_search = atoi(val);
         sqlite3_free(val);
+      } else if (parse_arg(argv[i], "type", &val)) {
+        if (strcmp(val, "float32") == 0 || strcmp(val, "f32") == 0)
+          p->storage_type = VEC_STORAGE_F32;
+        else if (strcmp(val, "int8") == 0 || strcmp(val, "i8") == 0)
+          p->storage_type = VEC_STORAGE_INT8;
+        else if (strcmp(val, "binary") == 0 || strcmp(val, "bit") == 0)
+          p->storage_type = VEC_STORAGE_BIT;
+        else {
+          *pzErr = sqlite3_mprintf("vec0: unknown type '%s'", val);
+          sqlite3_free(val);
+          vec0_free(p);
+          return SQLITE_ERROR;
+        }
+        sqlite3_free(val);
       }
     }
 
@@ -480,10 +548,14 @@ static int vec0Init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
     return SQLITE_ERROR;
   }
 
-  /* Resolve distance kernel from metric string */
-  p->dist_fn = distance_for_metric(p->metric);
+  /* Resolve distance kernel from metric string + storage type */
+  p->dist_fn = distance_for_metric_typed(p->metric, p->storage_type);
   if (!p->dist_fn) {
-    *pzErr = sqlite3_mprintf("vec0: unknown metric '%s'", p->metric);
+    *pzErr = sqlite3_mprintf("vec0: metric '%s' not supported for type '%s'",
+                             p->metric,
+                             p->storage_type == VEC_STORAGE_INT8  ? "int8"
+                             : p->storage_type == VEC_STORAGE_BIT ? "binary"
+                                                                  : "float32");
     vec0_free(p);
     return SQLITE_ERROR;
   }
@@ -919,10 +991,17 @@ static int vec0_filter_knn(Vec0Cursor *cur, int idxNum, int argc,
   if (base_idxnum >= 151 && base_idxnum <= 156) {
     static const char *op_metrics[] = {"l2", "cosine",  "ip",
                                        "l1", "hamming", "jaccard"};
-    dist_fn_t override = distance_for_metric(op_metrics[base_idxnum - 151]);
+    dist_fn_t override = distance_for_metric_typed(
+        op_metrics[base_idxnum - 151], p->storage_type);
     if (override)
       knn_dist_fn = override;
   }
+
+  /* Convert query vector to storage type for HNSW search */
+  int q_blob_bytes = 0;
+  void *q_storage = vec_convert_to_storage(query_vec, query_dims,
+                                           p->storage_type, &q_blob_bytes);
+  const void *q_ptr = q_storage ? q_storage : (const void *)query_vec;
 
   HnswCtx hctx;
   vec0_make_hctx(p, &hctx);
@@ -931,7 +1010,8 @@ static int vec0_filter_knn(Vec0Cursor *cur, int idxNum, int argc,
 
   HnswResult *results = NULL;
   int nResults = 0;
-  rc = hnsw_search(&hctx, query_vec, k, &results, &nResults);
+  rc = hnsw_search(&hctx, q_ptr, k, &results, &nResults);
+  sqlite3_free(q_storage);
   sqlite3_free(query_vec);
   if (rc != SQLITE_OK)
     return rc;
@@ -1021,13 +1101,57 @@ static void vec0_result_vector_text(Vec0Cursor *cur, sqlite3_context *ctx) {
   int step_rc = sqlite3_step(p->sc_get_vec);
   if (step_rc == SQLITE_ROW) {
     int bytes = sqlite3_column_bytes(p->sc_get_vec, 0);
-    const float *blob = (const float *)sqlite3_column_blob(p->sc_get_vec, 0);
-    int dims = bytes / (int)sizeof(float);
-    char *text = vec_format(blob, dims);
-    if (text)
-      sqlite3_result_text(ctx, text, -1, sqlite3_free);
-    else
-      sqlite3_result_null(ctx);
+    const void *blob = sqlite3_column_blob(p->sc_get_vec, 0);
+
+    if (p->storage_type == VEC_STORAGE_INT8) {
+      /* Convert int8 back to float for text output */
+      int dims = bytes;
+      float *tmp = sqlite3_malloc(dims * (int)sizeof(float));
+      if (tmp) {
+        const int8_t *ib = (const int8_t *)blob;
+        for (int i = 0; i < dims; i++)
+          tmp[i] = (float)ib[i];
+        char *text = vec_format(tmp, dims);
+        sqlite3_free(tmp);
+        if (text)
+          sqlite3_result_text(ctx, text, -1, sqlite3_free);
+        else
+          sqlite3_result_null(ctx);
+      } else {
+        sqlite3_result_null(ctx);
+      }
+    } else if (p->storage_type == VEC_STORAGE_BIT) {
+      /* Format bit-packed vector as [0,1,0,1,...] */
+      const uint8_t *bits = (const uint8_t *)blob;
+      int dims = p->dims;
+      /* Each dim takes 2 chars (digit+comma) minus trailing comma, plus
+       * brackets */
+      int buflen = 1 + dims * 2 + 1;
+      char *text = sqlite3_malloc(buflen);
+      if (text) {
+        int pos = 0;
+        text[pos++] = '[';
+        for (int i = 0; i < dims; i++) {
+          if (i > 0)
+            text[pos++] = ',';
+          text[pos++] = (bits[i / 8] & (1 << (7 - (i % 8)))) ? '1' : '0';
+        }
+        text[pos++] = ']';
+        text[pos] = '\0';
+        sqlite3_result_text(ctx, text, pos, sqlite3_free);
+      } else {
+        sqlite3_result_null(ctx);
+      }
+    } else {
+      /* VEC_STORAGE_F32 — original behavior */
+      const float *fblob = (const float *)blob;
+      int dims = bytes / (int)sizeof(float);
+      char *text = vec_format(fblob, dims);
+      if (text)
+        sqlite3_result_text(ctx, text, -1, sqlite3_free);
+      else
+        sqlite3_result_null(ctx);
+    }
   } else {
     sqlite3_result_null(ctx);
   }
@@ -1183,16 +1307,22 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     if (p->count > 0)
       p->count--;
 
-    /* Re-insert with same rowid */
+    /* Re-insert with same rowid, converting to native storage type */
+    int upd_blob_bytes = 0;
+    void *upd_storage = vec_convert_to_storage(
+        upd_vec, upd_dims, p->storage_type, &upd_blob_bytes);
+    const void *upd_bind = upd_storage ? upd_storage : (const void *)upd_vec;
+
     vec0_stmt_rewind(p->sc_ins_data_id);
     sqlite3_bind_int64(p->sc_ins_data_id, 1, old_rowid);
-    sqlite3_bind_blob(p->sc_ins_data_id, 2, upd_vec,
-                      upd_dims * (int)sizeof(float), SQLITE_STATIC);
+    sqlite3_bind_blob(p->sc_ins_data_id, 2, upd_bind, upd_blob_bytes,
+                      SQLITE_STATIC);
     upd_rc = sqlite3_step(p->sc_ins_data_id);
     if (upd_rc != SQLITE_DONE) {
       p->count = pre_count;
       p->entry_point = pre_ep;
       p->max_layer = pre_ml;
+      sqlite3_free(upd_storage);
       sqlite3_free(upd_vec);
       pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
       return SQLITE_ERROR;
@@ -1200,10 +1330,11 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     p->count++;
     *pRowid = old_rowid;
 
-    /* Re-insert into HNSW graph */
+    /* Re-insert into HNSW graph — pass storage-type blob */
     HnswCtx ins_ctx;
     vec0_make_hctx(p, &ins_ctx);
-    upd_rc = hnsw_insert(&ins_ctx, old_rowid, upd_vec);
+    upd_rc = hnsw_insert(&ins_ctx, old_rowid, upd_bind);
+    sqlite3_free(upd_storage);
     sqlite3_free(upd_vec);
     if (upd_rc != SQLITE_OK) {
       p->count = pre_count;
@@ -1249,15 +1380,20 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
     return SQLITE_CONSTRAINT;
   }
 
-  /* Insert raw float BLOB into _data using cached statement.
+  /* Insert vector BLOB into _data, converting to native storage type.
    * SQLite's automatic statement savepoint ensures that if hnsw_insert later
    * fails and we return an error, the _data row and any partial graph writes
    * are rolled back automatically by SQLite. */
+  int blob_bytes = 0;
+  void *storage_vec =
+      vec_convert_to_storage(vec, dims, p->storage_type, &blob_bytes);
+  const void *bind_ptr = storage_vec ? storage_vec : (const void *)vec;
+
   vec0_stmt_rewind(p->sc_ins_data);
-  sqlite3_bind_blob(p->sc_ins_data, 1, vec, dims * (int)sizeof(float),
-                    SQLITE_STATIC);
+  sqlite3_bind_blob(p->sc_ins_data, 1, bind_ptr, blob_bytes, SQLITE_STATIC);
   rc = sqlite3_step(p->sc_ins_data);
   if (rc != SQLITE_DONE) {
+    sqlite3_free(storage_vec);
     sqlite3_free(vec);
     pVtab->zErrMsg = sqlite3_mprintf("%s", sqlite3_errmsg(p->db));
     return SQLITE_ERROR;
@@ -1266,10 +1402,11 @@ static int vec0Update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
   *pRowid = sqlite3_last_insert_rowid(p->db);
   p->count++;
 
-  /* Insert into HNSW graph */
+  /* Insert into HNSW graph — pass the storage-type blob */
   HnswCtx hctx;
   vec0_make_hctx(p, &hctx);
-  rc = hnsw_insert(&hctx, *pRowid, vec);
+  rc = hnsw_insert(&hctx, *pRowid, bind_ptr);
+  sqlite3_free(storage_vec);
   sqlite3_free(vec);
   if (rc != SQLITE_OK) {
     p->count--;

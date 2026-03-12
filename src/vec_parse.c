@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <sqlite3ext.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -106,6 +107,93 @@ char *vec_format(const float *vec, int dims) {
   buf[pos++] = ']';
   buf[pos] = '\0';
   return buf;
+}
+
+/* ── Int8 Parsing ────────────────────────────────────────────────────────────
+ */
+
+int vec_parse_int8(const char *text, int8_t **out_vec, int *out_dims,
+                   char **pzErr) {
+  const char *p = text;
+
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+    p++;
+
+  if (*p != '[') {
+    *pzErr = sqlite3_mprintf("vec_int8: expected '[' at start, got '%.10s'", p);
+    return SQLITE_ERROR;
+  }
+  p++;
+
+  int capacity = 16;
+  int ndims = 0;
+  int8_t *vec = sqlite3_malloc64(capacity);
+  if (!vec)
+    return SQLITE_NOMEM;
+
+  while (1) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')
+      p++;
+
+    if (*p == ']') {
+      p++;
+      break;
+    }
+
+    if (*p == '\0') {
+      sqlite3_free(vec);
+      *pzErr = sqlite3_mprintf("vec_int8: unterminated vector, expected ']'");
+      return SQLITE_ERROR;
+    }
+
+    char *end;
+    long val = strtol(p, &end, 10);
+    if (end == p) {
+      sqlite3_free(vec);
+      *pzErr = sqlite3_mprintf("vec_int8: invalid integer value '%.20s'", p);
+      return SQLITE_ERROR;
+    }
+    if (val < -128 || val > 127) {
+      sqlite3_free(vec);
+      *pzErr =
+          sqlite3_mprintf("vec_int8: value %ld out of range [-128, 127]", val);
+      return SQLITE_ERROR;
+    }
+    p = end;
+
+    if (ndims == capacity) {
+      capacity *= 2;
+      int8_t *tmp = sqlite3_realloc64(vec, capacity);
+      if (!tmp) {
+        sqlite3_free(vec);
+        return SQLITE_NOMEM;
+      }
+      vec = tmp;
+    }
+    vec[ndims++] = (int8_t)val;
+  }
+
+  if (ndims == 0) {
+    sqlite3_free(vec);
+    *pzErr = sqlite3_mprintf("vec_int8: empty vector not allowed");
+    return SQLITE_ERROR;
+  }
+
+  *out_vec = vec;
+  *out_dims = ndims;
+  return SQLITE_OK;
+}
+
+/* ── Bit-packed Validation ───────────────────────────────────────────────────
+ */
+
+int vec_parse_bit(const void *blob, int bytes, int *out_bits, char **pzErr) {
+  if (!blob || bytes <= 0) {
+    *pzErr = sqlite3_mprintf("vec_bit: empty blob not allowed");
+    return SQLITE_ERROR;
+  }
+  *out_bits = bytes * 8;
+  return SQLITE_OK;
 }
 
 /* ── SQL scalar functions ────────────────────────────────────────────────────

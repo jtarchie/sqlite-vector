@@ -2,6 +2,7 @@
 #define SQLITE_VECTOR_HNSW_H
 
 #include "distance.h"
+#include "vtab.h"
 #include <sqlite3ext.h>
 #include <stdint.h>
 
@@ -22,6 +23,7 @@ typedef struct HnswCtx {
   int ef_search;             /* beam width during query */
   sqlite3_int64 entry_point; /* rowid of entry-point node; -1 when empty */
   int max_layer;             /* current top layer */
+  int storage_type;          /* VEC_STORAGE_F32/INT8/BIT */
   dist_fn_t dist_fn;         /* distance kernel (set from metric string) */
 
   /* If non-zero, update_config() skips DB writes (deferred to xCommit). */
@@ -65,7 +67,7 @@ typedef struct HnswResult {
  *             sqlite3_free), sets *out_n to number of results.
  * Returns 0 results (not an error) when the graph is empty.
  */
-int hnsw_search(HnswCtx *ctx, const float *query_vec, int k,
+int hnsw_search(HnswCtx *ctx, const void *query_vec, int k,
                 HnswResult **out_results, int *out_n);
 
 /*
@@ -75,7 +77,7 @@ int hnsw_search(HnswCtx *ctx, const float *query_vec, int k,
  * Writes to {tbl_name}_layers and {tbl_name}_graph.
  * Updates ctx->entry_point and ctx->max_layer, and persists both to _config.
  */
-int hnsw_insert(HnswCtx *ctx, sqlite3_int64 rowid, const float *vec);
+int hnsw_insert(HnswCtx *ctx, sqlite3_int64 rowid, const void *vec);
 
 /*
  * hnsw_delete — remove a node from the HNSW graph.

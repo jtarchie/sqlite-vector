@@ -33,7 +33,10 @@ def parse_args
     maintenance_every_chunks: 0,
     checkpoint_mode: 'PASSIVE',
     post_ingest_optimize: true,
-    force_redownload: false
+    force_redownload: false,
+    vec_type: 'float32',
+    hnsw_m: 16,
+    ef_construction: 200
   }
 
   OptionParser.new do |opts|
@@ -53,6 +56,10 @@ def parse_args
     opts.on('--checkpoint-mode MODE', String, 'WAL checkpoint mode: PASSIVE|FULL|RESTART|TRUNCATE') { |v| options[:checkpoint_mode] = v }
     opts.on('--[no-]post-ingest-optimize', 'Run PRAGMA optimize after ingest (default: true)') { |v| options[:post_ingest_optimize] = v }
     opts.on('--force-redownload', 'Redownload dump from scratch') { options[:force_redownload] = true }
+    opts.on('--vec-type TYPE', String, 'Vector storage type: float32, int8, binary (default: float32)') { |v| options[:vec_type] = v }
+    opts.on('--[no-]quantize', '[DEPRECATED] Alias for --vec-type int8') { |v| options[:vec_type] = v ? 'int8' : 'float32' }
+    opts.on('--hnsw-m N', Integer, 'HNSW connections per layer (default: 16)') { |v| options[:hnsw_m] = v }
+    opts.on('--ef-construction N', Integer, 'HNSW build-time beam width (default: 200)') { |v| options[:ef_construction] = v }
   end.parse!
 
   options
@@ -362,7 +369,7 @@ def set_state(conn, stmts, key, value)
   end
 end
 
-def ensure_vector_table(conn, dims)
+def ensure_vector_table(conn, dims, m:, ef_construction:, vec_type:)
   current_dims = get_state(conn, 'vec_dims')
   if current_dims && current_dims.to_i != dims
     raise "Existing vector dims=#{current_dims}, but new embeddings use dims=#{dims}"
@@ -373,9 +380,14 @@ def ensure_vector_table(conn, dims)
     VEC_TABLE
   )
 
-  conn.execute("CREATE VIRTUAL TABLE #{VEC_TABLE} USING vec0(dims=#{dims}, metric=cosine, ef_search=50)") unless exists
+  unless exists
+    conn.execute(
+      "CREATE VIRTUAL TABLE #{VEC_TABLE} USING vec0(dims=#{dims}, metric=cosine, ef_search=50, m=#{m}, ef_construction=#{ef_construction}, type=#{vec_type})"
+    )
+  end
 
   set_state(conn, nil, 'vec_dims', dims.to_s)
+  set_state(conn, nil, 'vec_type', vec_type)
 end
 
 def upsert_article(conn, stmts, page_id, title)
@@ -470,9 +482,9 @@ def main
 
     if vector_dims.nil?
       vector_dims = embeddings[0].length
-      ensure_vector_table(conn, vector_dims)
+      ensure_vector_table(conn, vector_dims, m: options[:hnsw_m], ef_construction: options[:ef_construction], vec_type: options[:vec_type])
       stmts = prepare_ingest_stmts(conn)
-      puts "[setup] created #{VEC_TABLE} with dims=#{vector_dims}"
+      puts "[setup] created #{VEC_TABLE} with dims=#{vector_dims} m=#{options[:hnsw_m]} ef_construction=#{options[:ef_construction]} type=#{options[:vec_type]}"
     end
     stmts ||= prepare_ingest_stmts(conn)
 
